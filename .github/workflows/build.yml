@@ -13,6 +13,12 @@ jobs:
     outputs:
       project-path: ${{ steps.create.outputs.path }}
     steps:
+      # ✅ Install Flutter first (this fixes the "command not found" error)
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+
       - name: Create Flutter project and write source code
         id: create
         run: |
@@ -82,7 +88,7 @@ jobs:
           }
           DART
 
-          # mtproto_proxy_server.dart (MTProto bridge – full code as in previous answer)
+          # mtproto_proxy_server.dart (MTProto bridge – full code)
           cat <<'DART' > lib/services/mtproto_proxy_server.dart
           import 'dart:async';
           import 'dart:io';
