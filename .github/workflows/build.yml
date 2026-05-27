@@ -7,25 +7,24 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Step 1 – Generate the Flutter project once
+  # --- Generate the full Flutter project source code ---
   setup-project:
     runs-on: ubuntu-latest
     outputs:
       project-path: ${{ steps.create.outputs.path }}
     steps:
-      # ✅ Install Flutter first (this fixes the "command not found" error)
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.22.0'
           channel: 'stable'
 
-      - name: Create Flutter project and write source code
+      - name: Create project and write all Dart source files
         id: create
         run: |
           flutter create tg_ws_proxy --org com.example --platforms android,linux,macos,windows
           cd tg_ws_proxy
 
-          # pubspec.yaml
+          # ----------------- pubspec.yaml -----------------
           cat <<YAML > pubspec.yaml
           name: tg_ws_proxy
           description: MTProto Proxy Manager for Telegram via Cloudflare Workers
@@ -54,7 +53,7 @@ jobs:
 
           mkdir -p lib/{models,services,providers,screens,widgets}
 
-          # worker.dart
+          # ----------------- worker.dart -----------------
           cat <<'DART' > lib/models/worker.dart
           class Worker {
             final String id;
@@ -65,7 +64,7 @@ jobs:
           }
           DART
 
-          # clipboard_service.dart
+          # ----------------- clipboard_service.dart -----------------
           cat <<'DART' > lib/services/clipboard_service.dart
           import 'package:flutter/services.dart';
           class ClipboardService {
@@ -76,7 +75,7 @@ jobs:
           }
           DART
 
-          # telegram_service.dart
+          # ----------------- telegram_service.dart -----------------
           cat <<'DART' > lib/services/telegram_service.dart
           import 'package:url_launcher/url_launcher.dart';
           class TelegramService {
@@ -88,7 +87,7 @@ jobs:
           }
           DART
 
-          # mtproto_proxy_server.dart (MTProto bridge – full code)
+          # ----------------- mtproto_proxy_server.dart -----------------
           cat <<'DART' > lib/services/mtproto_proxy_server.dart
           import 'dart:async';
           import 'dart:io';
@@ -174,7 +173,7 @@ jobs:
           }
           DART
 
-          # app_state.dart
+          # ----------------- app_state.dart -----------------
           cat <<'DART' > lib/providers/app_state.dart
           import 'package:flutter/foundation.dart';
           import 'package:uuid/uuid.dart';
@@ -236,7 +235,7 @@ jobs:
           }
           DART
 
-          # home_screen.dart
+          # ----------------- home_screen.dart -----------------
           cat <<'DART' > lib/screens/home_screen.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
@@ -291,7 +290,7 @@ jobs:
           }
           DART
 
-          # worker_tile.dart
+          # ----------------- worker_tile.dart -----------------
           cat <<'DART' > lib/widgets/worker_tile.dart
           import 'package:flutter/material.dart';
           import '../models/worker.dart';
@@ -308,7 +307,7 @@ jobs:
           }
           DART
 
-          # bottom_status_bar.dart
+          # ----------------- bottom_status_bar.dart -----------------
           cat <<'DART' > lib/widgets/bottom_status_bar.dart
           import 'package:flutter/material.dart';
           class BottomStatusBar extends StatelessWidget {
@@ -326,7 +325,7 @@ jobs:
           }
           DART
 
-          # main.dart
+          # ----------------- main.dart -----------------
           cat <<'DART' > lib/main.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
@@ -381,13 +380,13 @@ jobs:
           cd ..
           echo "path=$(pwd)/tg_ws_proxy" >> $GITHUB_OUTPUT
 
-      - name: Upload project for later jobs
+      - name: Upload project source code
         uses: actions/upload-artifact@v4
         with:
           name: project-source
           path: tg_ws_proxy/
 
-  # Step 2 – Build Android APK (universal) + Linux tar.gz on Ubuntu
+  # --- Build Android APK (universal) + Linux portable ---
   build-android-linux:
     needs: setup-project
     runs-on: ubuntu-latest
@@ -395,14 +394,25 @@ jobs:
       matrix:
         target: [apk, linux]
     steps:
+      - name: Install Linux system dependencies
+        if: matrix.target == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libblkid-dev
+
       - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
+
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.22.0'
           channel: 'stable'
+
+      - name: Accept Android licenses
+        if: matrix.target == 'apk'
+        run: yes | flutter doctor --android-licenses || true
 
       - name: Download project source
         uses: actions/download-artifact@v4
@@ -435,7 +445,7 @@ jobs:
           name: android-linux-${{ matrix.target }}
           path: artifacts/
 
-  # Step 3 – Build macOS DMG on macOS
+  # --- Build macOS app and package as DMG ---
   build-macos:
     needs: setup-project
     runs-on: macos-latest
@@ -444,6 +454,7 @@ jobs:
         with:
           flutter-version: '3.22.0'
           channel: 'stable'
+
       - name: Download project source
         uses: actions/download-artifact@v4
         with:
@@ -472,7 +483,7 @@ jobs:
           name: macos-dmg
           path: artifacts/
 
-  # Step 4 – Build Windows zip on Windows
+  # --- Build Windows portable zip ---
   build-windows:
     needs: setup-project
     runs-on: windows-latest
@@ -481,6 +492,7 @@ jobs:
         with:
           flutter-version: '3.22.0'
           channel: 'stable'
+
       - name: Download project source
         uses: actions/download-artifact@v4
         with:
