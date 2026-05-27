@@ -3,17 +3,14 @@ name: Build & Release All Platforms
 on:
   push:
     tags:
-      - 'v*'           # only version tags (e.g. v1.0.0)
-  workflow_dispatch:    # manual trigger from the Actions tab
+      - 'v*'
+  workflow_dispatch:
 
-# Grant write access to create a release
 permissions:
   contents: write
 
 jobs:
-  # ──────────────────────────────────────────────────────
-  # 1. Generate the Flutter project (source code)
-  # ──────────────────────────────────────────────────────
+  # ─────────── Setup project source code ───────────
   setup-project:
     runs-on: ubuntu-latest
     outputs:
@@ -30,7 +27,7 @@ jobs:
           flutter create tg_ws_proxy --org com.example --platforms android,linux,macos,windows
           cd tg_ws_proxy
 
-          # ----- pubspec.yaml -----
+          # pubspec.yaml
           cat <<'YAML' > pubspec.yaml
           name: tg_ws_proxy
           description: MTProto Proxy Manager for Telegram via Cloudflare Workers
@@ -59,7 +56,7 @@ jobs:
 
           mkdir -p lib/{models,services,providers,screens,widgets}
 
-          # ----- worker.dart -----
+          # worker.dart
           cat <<'DART' > lib/models/worker.dart
           class Worker {
             final String id;
@@ -70,7 +67,7 @@ jobs:
           }
           DART
 
-          # ----- clipboard_service.dart -----
+          # clipboard_service.dart
           cat <<'DART' > lib/services/clipboard_service.dart
           import 'package:flutter/services.dart';
           class ClipboardService {
@@ -81,7 +78,7 @@ jobs:
           }
           DART
 
-          # ----- telegram_service.dart -----
+          # telegram_service.dart
           cat <<'DART' > lib/services/telegram_service.dart
           import 'package:url_launcher/url_launcher.dart';
           class TelegramService {
@@ -93,7 +90,7 @@ jobs:
           }
           DART
 
-          # ----- mtproto_proxy_server.dart (MTProto bridge) -----
+          # mtproto_proxy_server.dart (MTProto bridge)
           cat <<'DART' > lib/services/mtproto_proxy_server.dart
           import 'dart:async';
           import 'dart:io';
@@ -179,7 +176,7 @@ jobs:
           }
           DART
 
-          # ----- app_state.dart -----
+          # app_state.dart
           cat <<'DART' > lib/providers/app_state.dart
           import 'package:flutter/foundation.dart';
           import 'package:uuid/uuid.dart';
@@ -241,7 +238,7 @@ jobs:
           }
           DART
 
-          # ----- home_screen.dart -----
+          # home_screen.dart
           cat <<'DART' > lib/screens/home_screen.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
@@ -296,7 +293,7 @@ jobs:
           }
           DART
 
-          # ----- worker_tile.dart -----
+          # worker_tile.dart
           cat <<'DART' > lib/widgets/worker_tile.dart
           import 'package:flutter/material.dart';
           import '../models/worker.dart';
@@ -313,7 +310,7 @@ jobs:
           }
           DART
 
-          # ----- bottom_status_bar.dart -----
+          # bottom_status_bar.dart
           cat <<'DART' > lib/widgets/bottom_status_bar.dart
           import 'package:flutter/material.dart';
           class BottomStatusBar extends StatelessWidget {
@@ -331,7 +328,7 @@ jobs:
           }
           DART
 
-          # ----- main.dart -----
+          # main.dart
           cat <<'DART' > lib/main.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
@@ -365,7 +362,7 @@ jobs:
           }
           DART
 
-          # ----- macOS Info.plist -----
+          # macOS Info.plist
           cat <<'PLIST' > macos/Runner/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -392,9 +389,7 @@ jobs:
           name: project-source
           path: tg_ws_proxy/
 
-  # ──────────────────────────────────────────────────────
-  # 2. Build Android APK (universal)
-  # ──────────────────────────────────────────────────────
+  # ─────────── Android ───────────
   build-android:
     needs: setup-project
     runs-on: ubuntu-latest
@@ -427,26 +422,36 @@ jobs:
           name: android-apk
           path: release-artifacts/
 
-  # ──────────────────────────────────────────────────────
-  # 3. Build Linux portable tarball
-  # ──────────────────────────────────────────────────────
+  # ─────────── Linux ───────────
   build-linux:
     needs: setup-project
     runs-on: ubuntu-latest
     steps:
-      - name: Install Linux system dependencies
+      - name: Install ALL required Linux libraries for Flutter desktop
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libblkid-dev
+          sudo apt-get install -y \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libblkid-dev \
+            libglu1-mesa-dev libpulse-dev \
+            libasound2-dev libavformat-dev libavcodec-dev libavutil-dev \
+            libavfilter-dev libavdevice-dev libx11-dev libxext-dev \
+            libxrandr-dev libxi-dev libxcomposite-dev libxcursor-dev \
+            libxdamage-dev libxrender-dev libxtst-dev \
+            libepoxy-dev libpng-dev libharfbuzz-dev \
+            libfontconfig1-dev libfreetype6-dev
+
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.22.0'
           channel: 'stable'
+
       - name: Download project source
         uses: actions/download-artifact@v4
         with:
           name: project-source
           path: tg_ws_proxy
+
       - name: Build Linux
         working-directory: tg_ws_proxy
         run: |
@@ -455,15 +460,14 @@ jobs:
           mkdir -p ../release-artifacts
           cd build/linux/x64/release/bundle
           tar -czf ../../../../../release-artifacts/tg_ws_proxy_1.0.0_linux_universal.tar.gz .
+
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-tarball
           path: release-artifacts/
 
-  # ──────────────────────────────────────────────────────
-  # 4. Build macOS DMG
-  # ──────────────────────────────────────────────────────
+  # ─────────── macOS ───────────
   build-macos:
     needs: setup-project
     runs-on: macos-latest
@@ -498,9 +502,7 @@ jobs:
           name: macos-dmg
           path: release-artifacts/
 
-  # ──────────────────────────────────────────────────────
-  # 5. Build Windows portable ZIP
-  # ──────────────────────────────────────────────────────
+  # ─────────── Windows ───────────
   build-windows:
     needs: setup-project
     runs-on: windows-latest
@@ -530,18 +532,20 @@ jobs:
           name: windows-zip
           path: release-artifacts/
 
-  # ──────────────────────────────────────────────────────
-  # 6. Create GitHub Release and upload all artifacts
-  # ──────────────────────────────────────────────────────
+  # ─────────── Create GitHub Release (always, even if some builds fail) ───────────
   github-release:
     needs: [build-android, build-linux, build-macos, build-windows]
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Download all available artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
           merge-multiple: true
+
+      - name: List files for release
+        run: ls -R release-artifacts
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -551,9 +555,9 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            release-artifacts/tg_ws_proxy_1.0.0_android_universal.apk
-            release-artifacts/tg_ws_proxy_1.0.0_linux_universal.tar.gz
-            release-artifacts/tg_ws_proxy_1.0.0_macos_universal.dmg
-            release-artifacts/tg_ws_proxy_1.0.0_windows_universal.zip
+            release-artifacts/*.apk
+            release-artifacts/*.tar.gz
+            release-artifacts/*.dmg
+            release-artifacts/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
