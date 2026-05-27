@@ -30,7 +30,7 @@ jobs:
           # pubspec.yaml
           cat <<'YAML' > pubspec.yaml
           name: tg_ws_proxy
-          description: MTProto Proxy Manager for Telegram via Cloudflare Workers
+          description: SOCKS5 Proxy Manager for Telegram via Cloudflare Workers
           publish_to: 'none'
           version: 1.0.0
 
@@ -93,7 +93,7 @@ jobs:
           }
           DART
 
-          # ---------- services/ping_service.dart (TCP‑based fix) ----------
+          # ---------- services/ping_service.dart ----------
           cat <<'DART' > lib/services/ping_service.dart
           import 'dart:async';
           import 'dart:io';
@@ -128,13 +128,13 @@ jobs:
           import 'package:url_launcher/url_launcher.dart';
 
           class TelegramService {
+            /// Opens Telegram SOCKS5 proxy settings (works on desktop & mobile).
             Future<bool> openTelegramProxySettings({
               required String server,
               required int port,
-              required String secret,
             }) async {
               final uri = Uri.parse(
-                'tg://proxy?server=$server&port=$port&secret=$secret',
+                'tg://socks?server=$server&port=$port',
               );
               if (await canLaunchUrl(uri)) {
                 return launchUrl(uri, mode: LaunchMode.externalApplication);
@@ -144,20 +144,21 @@ jobs:
           }
           DART
 
-          # ---------- services/mtproto_proxy_server.dart ----------
-          cat <<'DART' > lib/services/mtproto_proxy_server.dart
+          # ---------- services/socks5_proxy_server.dart ----------
+          cat <<'DART' > lib/services/socks5_proxy_server.dart
           import 'dart:async';
           import 'dart:io';
+          import 'dart:typed_data';
           import 'package:web_socket_channel/web_socket_channel.dart';
           import '../models/worker.dart';
 
-          class MtprotoProxyServer {
+          class Socks5ProxyServer {
             ServerSocket? _server;
             bool _isRunning = false;
             String _status = 'Stopped';
             int _activeConnections = 0;
             String _bindHost = '127.0.0.1';
-            int _bindPort = 8080;
+            int _bindPort = 1080;
             final StreamController<String> _statusController =
                 StreamController<String>.broadcast();
             final StreamController<int> _connectionsController =
@@ -199,7 +200,7 @@ jobs:
               try {
                 _server = await ServerSocket.bind(_bindHost, _bindPort);
                 _isRunning = true;
-                _updateStatus('Running (MTProto)');
+                _updateStatus('Running (SOCKS5)');
                 _server!.listen(_handleConnection);
               } catch (e) {
                 _updateStatus('Error: $e');
@@ -224,20 +225,30 @@ jobs:
               _activeConnections++;
               _connectionsController.add(_activeConnections);
               try {
-                final handshake = await clientSocket.fold<List<int>>(
-                  <int>[],
-                  (prev, chunk) => prev..addAll(chunk),
-                );
-                if (handshake.length < 20) {
+                // SOCKS5 handshake (no auth)
+                final data = await clientSocket.first;
+                if (data.length < 3 || data[0] != 0x05) {
                   clientSocket.destroy();
                   return;
                 }
-                final remainingData = handshake.sublist(20);
+                clientSocket.add(Uint8List.fromList([0x05, 0x00])); // no auth
+
+                // SOCKS5 request
+                final req = await clientSocket.first;
+                if (req.length < 10 || req[0] != 0x05 || req[1] != 0x01) {
+                  clientSocket.destroy();
+                  return;
+                }
+                // Always respond with success (we don't need the real destination)
+                clientSocket.add(Uint8List.fromList(
+                    [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+
+                // Connect to worker via WebSocket
                 final wsChannel =
                     WebSocketChannel.connect(Uri.parse(_activeWorker!.url));
                 final wsSink = wsChannel.sink;
                 final wsStream = wsChannel.stream;
-                if (remainingData.isNotEmpty) wsSink.add(remainingData);
+
                 final socketToWs = clientSocket.listen(
                   (data) { wsSink.add(data); },
                   onDone: () { wsSink.close(); },
@@ -281,17 +292,16 @@ jobs:
 
           # ---------- providers/app_state.dart ----------
           cat <<'DART' > lib/providers/app_state.dart
-          import 'dart:math';
           import 'package:flutter/foundation.dart';
           import 'package:uuid/uuid.dart';
           import '../models/worker.dart';
           import '../services/clipboard_service.dart';
-          import '../services/mtproto_proxy_server.dart';
+          import '../services/socks5_proxy_server.dart';
           import '../services/telegram_service.dart';
           import '../services/ping_service.dart';
 
           class AppState extends ChangeNotifier {
-            final MtprotoProxyServer proxyServer;
+            final Socks5ProxyServer proxyServer;
             final ClipboardService clipboardService;
             final TelegramService telegramService;
             final PingService pingService;
@@ -302,15 +312,6 @@ jobs:
             String _proxyStatus = 'Stopped';
             final List<String> _logs = [];
             int _activeConnections = 0;
-
-            late final String _proxySecret = _generateSecret();
-
-            static String _generateSecret() {
-              final rng = Random.secure();
-              final bytes = List<int>.generate(16, (_) => rng.nextInt(256));
-              return 'dd' +
-                  bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-            }
 
             AppState({
               required this.proxyServer,
@@ -421,9 +422,8 @@ jobs:
               final ok = await telegramService.openTelegramProxySettings(
                 server: bindHost,
                 port: bindPort,
-                secret: _proxySecret,
               );
-              _addLog(ok ? 'Opened Telegram (secret: $_proxySecret)' : 'Failed to open Telegram');
+              _addLog(ok ? 'Opened Telegram' : 'Failed to open Telegram');
             }
 
             void clearLogs() {
@@ -651,7 +651,7 @@ jobs:
           import 'providers/app_state.dart';
           import 'screens/home_screen.dart';
           import 'services/clipboard_service.dart';
-          import 'services/mtproto_proxy_server.dart';
+          import 'services/socks5_proxy_server.dart';
           import 'services/telegram_service.dart';
           import 'services/ping_service.dart';
 
@@ -660,9 +660,9 @@ jobs:
               Provider<ClipboardService>(create: (_) => ClipboardService()),
               Provider<TelegramService>(create: (_) => TelegramService()),
               Provider<PingService>(create: (_) => PingService()),
-              Provider<MtprotoProxyServer>(create: (_) => MtprotoProxyServer()),
+              Provider<Socks5ProxyServer>(create: (_) => Socks5ProxyServer()),
               ChangeNotifierProvider<AppState>(create: (ctx) => AppState(
-                proxyServer: ctx.read<MtprotoProxyServer>(),
+                proxyServer: ctx.read<Socks5ProxyServer>(),
                 clipboardService: ctx.read<ClipboardService>(),
                 telegramService: ctx.read<TelegramService>(),
                 pingService: ctx.read<PingService>(),
