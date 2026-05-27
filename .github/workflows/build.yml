@@ -56,41 +56,70 @@ jobs:
 
           mkdir -p lib/{models,services,providers,screens,widgets}
 
-          # worker.dart
+          # ---------- models/worker.dart ----------
           cat <<'DART' > lib/models/worker.dart
           class Worker {
             final String id;
             final String url;
             int requestCount;
             final int maxRequests;
-            Worker({required this.id, required this.url, this.requestCount = 0, this.maxRequests = 100000});
+            int pingLatency;   // ms, -1 = inactive
+            bool isOnline;
+
+            Worker({
+              required this.id,
+              required this.url,
+              this.requestCount = 0,
+              this.maxRequests = 100000,
+              this.pingLatency = -1,
+              this.isOnline = false,
+            });
           }
           DART
 
-          # clipboard_service.dart
+          # ---------- services/clipboard_service.dart ----------
           cat <<'DART' > lib/services/clipboard_service.dart
           import 'package:flutter/services.dart';
+
           class ClipboardService {
             Future<String?> getClipboardData() async {
               final data = await Clipboard.getData('text/plain');
               return data?.text;
             }
+
+            Future<void> setClipboardData(String text) async {
+              await Clipboard.setData(ClipboardData(text: text));
+            }
           }
           DART
 
-          # telegram_service.dart
+          # ---------- services/telegram_service.dart ----------
           cat <<'DART' > lib/services/telegram_service.dart
           import 'package:url_launcher/url_launcher.dart';
+
           class TelegramService {
-            Future<bool> openTelegramProxySettings({required String server, required int port}) async {
-              final uri = Uri(scheme: 'tg', host: 'proxy', queryParameters: {'server': server, 'port': port.toString(), 'secret': ''});
-              if (await canLaunchUrl(uri)) return launchUrl(uri, mode: LaunchMode.externalApplication);
+            Future<bool> openTelegramProxySettings({
+              required String server,
+              required int port,
+            }) async {
+              final uri = Uri(
+                scheme: 'tg',
+                host: 'proxy',
+                queryParameters: {
+                  'server': server,
+                  'port': port.toString(),
+                  'secret': '',
+                },
+              );
+              if (await canLaunchUrl(uri)) {
+                return launchUrl(uri, mode: LaunchMode.externalApplication);
+              }
               return false;
             }
           }
           DART
 
-          # mtproto_proxy_server.dart (MTProto bridge)
+          # ---------- services/mtproto_proxy_server.dart ----------
           cat <<'DART' > lib/services/mtproto_proxy_server.dart
           import 'dart:async';
           import 'dart:io';
@@ -102,30 +131,54 @@ jobs:
             bool _isRunning = false;
             String _status = 'Stopped';
             int _activeConnections = 0;
-            final StreamController<String> _statusController = StreamController<String>.broadcast();
-            final StreamController<int> _connectionsController = StreamController<int>.broadcast();
+            String _bindHost = '127.0.0.1';
+            int _bindPort = 8080;
+            final StreamController<String> _statusController =
+                StreamController<String>.broadcast();
+            final StreamController<int> _connectionsController =
+                StreamController<int>.broadcast();
             final List<Worker> _workers = [];
             Worker? _activeWorker;
             final List<StreamSubscription> _connectionSubscriptions = [];
 
             bool get isRunning => _isRunning;
             String get status => _status;
+            String get bindHost => _bindHost;
+            int get bindPort => _bindPort;
             Stream<String> get statusStream => _statusController.stream;
             Stream<int> get connectionsStream => _connectionsController.stream;
 
-            void setWorkers(List<Worker> workers) { _workers.clear(); _workers.addAll(workers); }
-            void setActiveWorker(Worker? worker) { _activeWorker = worker; }
+            void setBindAddress(String host, int port) {
+              _bindHost = host;
+              _bindPort = port;
+            }
 
-            Future<void> start({String host = '127.0.0.1', int port = 8080}) async {
+            void setWorkers(List<Worker> workers) {
+              _workers.clear();
+              _workers.addAll(workers);
+            }
+
+            void setActiveWorker(Worker? worker) {
+              _activeWorker = worker;
+            }
+
+            Future<void> start() async {
               if (_isRunning) return;
-              if (_activeWorker == null && _workers.isNotEmpty) _activeWorker = _workers.first;
-              if (_activeWorker == null) { _updateStatus('No active worker configured'); return; }
+              if (_activeWorker == null && _workers.isNotEmpty) {
+                _activeWorker = _workers.first;
+              }
+              if (_activeWorker == null) {
+                _updateStatus('No active worker configured');
+                return;
+              }
               try {
-                _server = await ServerSocket.bind(host, port);
+                _server = await ServerSocket.bind(_bindHost, _bindPort);
                 _isRunning = true;
                 _updateStatus('Running (MTProto)');
                 _server!.listen(_handleConnection);
-              } catch (e) { _updateStatus('Error: $e'); }
+              } catch (e) {
+                _updateStatus('Error: $e');
+              }
             }
 
             Future<void> stop() async {
@@ -135,48 +188,109 @@ jobs:
               _isRunning = false;
               _activeConnections = 0;
               _connectionsController.add(0);
-              for (final sub in _connectionSubscriptions) sub.cancel();
+              for (final sub in _connectionSubscriptions) {
+                sub.cancel();
+              }
               _connectionSubscriptions.clear();
               _updateStatus('Stopped');
             }
 
             void _handleConnection(Socket clientSocket) async {
-              _activeConnections++; _connectionsController.add(_activeConnections);
+              _activeConnections++;
+              _connectionsController.add(_activeConnections);
               try {
-                final handshake = await clientSocket.fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk));
-                if (handshake.length < 20) { clientSocket.destroy(); return; }
+                final handshake = await clientSocket.fold<List<int>>(
+                  <int>[],
+                  (prev, chunk) => prev..addAll(chunk),
+                );
+                if (handshake.length < 20) {
+                  clientSocket.destroy();
+                  return;
+                }
                 final remainingData = handshake.sublist(20);
-                final wsChannel = WebSocketChannel.connect(Uri.parse(_activeWorker!.url));
+                final wsChannel =
+                    WebSocketChannel.connect(Uri.parse(_activeWorker!.url));
                 final wsSink = wsChannel.sink;
                 final wsStream = wsChannel.stream;
                 if (remainingData.isNotEmpty) wsSink.add(remainingData);
                 final socketToWs = clientSocket.listen(
-                  (data) { wsSink.add(data); },
-                  onDone: () { wsSink.close(); },
-                  onError: (e) { wsSink.close(); },
+                  (data) {
+                    wsSink.add(data);
+                  },
+                  onDone: () {
+                    wsSink.close();
+                  },
+                  onError: (e) {
+                    wsSink.close();
+                  },
                   cancelOnError: true,
                 );
                 final wsToSocket = wsStream.listen(
-                  (data) { try { clientSocket.add(data); } catch (_) {} },
-                  onDone: () { clientSocket.destroy(); },
-                  onError: (e) { clientSocket.destroy(); },
+                  (data) {
+                    try {
+                      clientSocket.add(data);
+                    } catch (_) {}
+                  },
+                  onDone: () {
+                    clientSocket.destroy();
+                  },
+                  onError: (e) {
+                    clientSocket.destroy();
+                  },
                   cancelOnError: true,
                 );
                 _connectionSubscriptions.add(socketToWs);
                 _connectionSubscriptions.add(wsToSocket);
-                await Future.any([socketToWs.asFuture<void>(), wsToSocket.asFuture<void>()]);
-              } catch (e) { /* ignore */ } finally {
-                _activeConnections--; _connectionsController.add(_activeConnections);
-                try { clientSocket.destroy(); } catch (_) {}
+                await Future.any([
+                  socketToWs.asFuture<void>(),
+                  wsToSocket.asFuture<void>(),
+                ]);
+              } catch (e) {
+                /* ignore */
+              } finally {
+                _activeConnections--;
+                _connectionsController.add(_activeConnections);
+                try {
+                  clientSocket.destroy();
+                } catch (_) {}
               }
             }
 
-            void _updateStatus(String status) { _status = status; _statusController.add(status); }
-            void dispose() { _statusController.close(); _connectionsController.close(); }
+            void _updateStatus(String status) {
+              _status = status;
+              _statusController.add(status);
+            }
+
+            void dispose() {
+              _statusController.close();
+              _connectionsController.close();
+            }
           }
           DART
 
-          # app_state.dart
+          # ---------- services/ping_service.dart ----------
+          cat <<'DART' > lib/services/ping_service.dart
+          import 'dart:async';
+          import 'package:web_socket_channel/web_socket_channel.dart';
+
+          class PingService {
+            /// Returns latency in milliseconds, or -1 if failed.
+            Future<int> ping(String url) async {
+              try {
+                final stopwatch = Stopwatch()..start();
+                final channel = WebSocketChannel.connect(Uri.parse(url));
+                await channel.ready;
+                stopwatch.stop();
+                await channel.sink.close();
+                return stopwatch.elapsedMilliseconds;
+              } catch (e) {
+                return -1;
+              }
+            }
+          }
+          DART
+
+          # ---------- providers/app_state.dart ----------
           cat <<'DART' > lib/providers/app_state.dart
           import 'package:flutter/foundation.dart';
           import 'package:uuid/uuid.dart';
@@ -184,11 +298,14 @@ jobs:
           import '../services/clipboard_service.dart';
           import '../services/mtproto_proxy_server.dart';
           import '../services/telegram_service.dart';
+          import '../services/ping_service.dart';
 
           class AppState extends ChangeNotifier {
             final MtprotoProxyServer proxyServer;
             final ClipboardService clipboardService;
             final TelegramService telegramService;
+            final PingService pingService;
+
             List<Worker> _workers = [];
             Worker? _selectedWorker;
             bool _proxyRunning = false;
@@ -196,13 +313,23 @@ jobs:
             final List<String> _logs = [];
             int _activeConnections = 0;
 
-            AppState({required this.proxyServer, required this.clipboardService, required this.telegramService}) {
+            AppState({
+              required this.proxyServer,
+              required this.clipboardService,
+              required this.telegramService,
+              required this.pingService,
+            }) {
               proxyServer.statusStream.listen((status) {
-                _proxyStatus = status; _proxyRunning = proxyServer.isRunning;
+                _proxyStatus = status;
+                _proxyRunning = proxyServer.isRunning;
                 if (status.startsWith('Error')) _addLog('Error: $status');
                 notifyListeners();
               });
-              proxyServer.connectionsStream.listen((count) { _activeConnections = count; notifyListeners(); });
+
+              proxyServer.connectionsStream.listen((count) {
+                _activeConnections = count;
+                notifyListeners();
+              });
             }
 
             List<Worker> get workers => _workers;
@@ -212,6 +339,15 @@ jobs:
             List<String> get logs => _logs;
             int get activeConnections => _activeConnections;
 
+            String get bindHost => proxyServer.bindHost;
+            int get bindPort => proxyServer.bindPort;
+
+            void setBindAddress(String host, int port) {
+              proxyServer.setBindAddress(host, port);
+              _addLog('Bind address changed to $host:$port');
+              notifyListeners();
+            }
+
             Future<void> importWorkerFromClipboard() async {
               final text = await clipboardService.getClipboardData();
               if (text != null && text.isNotEmpty) {
@@ -220,115 +356,447 @@ jobs:
                 notifyListeners();
               }
             }
-            void selectWorker(Worker w) { _selectedWorker = w; _addLog('Selected ${w.url}'); notifyListeners(); }
-            void removeWorker(Worker w) { _workers.remove(w); if (_selectedWorker == w) _selectedWorker = null; _addLog('Removed ${w.url}'); notifyListeners(); }
-            Future<void> toggleProxy() async {
-              if (_proxyRunning) { await proxyServer.stop(); _addLog('Proxy stopped'); }
-              else { proxyServer.setWorkers(_workers); proxyServer.setActiveWorker(_selectedWorker); await proxyServer.start(); _addLog('Proxy started'); }
+
+            void selectWorker(Worker w) {
+              _selectedWorker = w;
+              _addLog('Selected ${w.url}');
               notifyListeners();
             }
+
+            void removeWorker(Worker w) {
+              _workers.remove(w);
+              if (_selectedWorker == w) _selectedWorker = null;
+              _addLog('Removed ${w.url}');
+              notifyListeners();
+            }
+
+            Future<void> copyWorkerUrl(Worker w) async {
+              await clipboardService.setClipboardData(w.url);
+              _addLog('Copied URL: ${w.url}');
+              notifyListeners();
+            }
+
+            Future<void> copyAllWorkers() async {
+              if (_workers.isEmpty) return;
+              final all = _workers.map((w) => w.url).join('\n');
+              await clipboardService.setClipboardData(all);
+              _addLog('Copied all worker URLs');
+              notifyListeners();
+            }
+
+            Future<void> pingAll() async {
+              _addLog('Pinging all workers...');
+              for (var w in _workers) {
+                final latency = await pingService.ping(w.url);
+                w.pingLatency = latency;
+                w.isOnline = latency != -1;
+                _addLog(
+                    '${w.url} -> ${w.isOnline ? "${latency}ms" : "OFFLINE"}');
+              }
+              notifyListeners();
+            }
+
+            Future<void> toggleProxy() async {
+              if (_proxyRunning) {
+                await proxyServer.stop();
+                _addLog('Proxy stopped');
+              } else {
+                proxyServer.setWorkers(_workers);
+                proxyServer.setActiveWorker(_selectedWorker);
+                await proxyServer.start();
+                _addLog('Proxy started');
+              }
+              notifyListeners();
+            }
+
             Future<void> openInTelegram() async {
-              final ok = await telegramService.openTelegramProxySettings(server: '127.0.0.1', port: 8080);
+              final ok = await telegramService.openTelegramProxySettings(
+                server: bindHost,
+                port: bindPort,
+              );
               _addLog(ok ? 'Opened Telegram' : 'Failed to open Telegram');
             }
-            void clearLogs() { _logs.clear(); notifyListeners(); }
-            void _addLog(String msg) { _logs.add('[${DateTime.now().toIso8601String()}] $msg'); if (_logs.length > 100) _logs.removeAt(0); notifyListeners(); }
+
+            void clearLogs() {
+              _logs.clear();
+              notifyListeners();
+            }
+
+            void _addLog(String msg) {
+              _logs.add('[${DateTime.now().toIso8601String()}] $msg');
+              if (_logs.length > 100) _logs.removeAt(0);
+              notifyListeners();
+            }
+
             @override
-            void dispose() { proxyServer.dispose(); super.dispose(); }
+            void dispose() {
+              proxyServer.dispose();
+              super.dispose();
+            }
           }
           DART
 
-          # home_screen.dart
+          # ---------- screens/home_screen.dart ----------
           cat <<'DART' > lib/screens/home_screen.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
           import '../providers/app_state.dart';
+          import '../models/worker.dart';
           import '../widgets/worker_tile.dart';
           import '../widgets/bottom_status_bar.dart';
+          import 'log_screen.dart';
 
           class HomeScreen extends StatefulWidget {
             const HomeScreen({super.key});
+
             @override
             State<HomeScreen> createState() => _HomeScreenState();
           }
+
           class _HomeScreenState extends State<HomeScreen> {
-            final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+            void _showSettings(BuildContext context) {
+              final app = context.read<AppState>();
+              final hostCtrl = TextEditingController(text: app.bindHost);
+              final portCtrl =
+                  TextEditingController(text: app.bindPort.toString());
+
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('Settings'),
+                  content: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextField(
+                        controller: hostCtrl,
+                        decoration: const InputDecoration(labelText: 'Bind IP'),
+                      ),
+                      TextField(
+                        controller: portCtrl,
+                        decoration:
+                            const InputDecoration(labelText: 'Bind Port'),
+                        keyboardType: TextInputType.number,
+                      ),
+                    ],
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(ctx),
+                      child: const Text('Cancel'),
+                    ),
+                    TextButton(
+                      onPressed: () {
+                        final host = hostCtrl.text.trim();
+                        final port = int.tryParse(portCtrl.text.trim());
+                        if (host.isNotEmpty && port != null && port > 0) {
+                          app.setBindAddress(host, port);
+                          Navigator.pop(ctx);
+                        }
+                      },
+                      child: const Text('Save'),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final app = context.watch<AppState>();
+
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text('TG WS Proxy'),
+                  centerTitle: true,
+                  actions: [
+                    PopupMenuButton<String>(
+                      icon: const Icon(Icons.more_vert),
+                      onSelected: (value) {
+                        switch (value) {
+                          case 'import':
+                            app.importWorkerFromClipboard();
+                            break;
+                          case 'copy_all':
+                            app.copyAllWorkers();
+                            break;
+                          case 'ping_all':
+                            app.pingAll();
+                            break;
+                          case 'logs':
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => const LogScreen(),
+                              ),
+                            );
+                            break;
+                          case 'settings':
+                            _showSettings(context);
+                            break;
+                        }
+                      },
+                      itemBuilder: (context) => [
+                        const PopupMenuItem(
+                          value: 'import',
+                          child: ListTile(
+                            leading: Icon(Icons.content_paste),
+                            title: Text('Import worker by clipboard'),
+                          ),
+                        ),
+                        const PopupMenuItem(
+                          value: 'copy_all',
+                          child: ListTile(
+                            leading: Icon(Icons.copy_all),
+                            title: Text('Copy all workers'),
+                          ),
+                        ),
+                        const PopupMenuItem(
+                          value: 'ping_all',
+                          child: ListTile(
+                            leading: Icon(Icons.speed),
+                            title: Text('Ping all'),
+                          ),
+                        ),
+                        const PopupMenuItem(
+                          value: 'logs',
+                          child: ListTile(
+                            leading: Icon(Icons.terminal),
+                            title: Text('Logs'),
+                          ),
+                        ),
+                        const PopupMenuItem(
+                          value: 'settings',
+                          child: ListTile(
+                            leading: Icon(Icons.settings),
+                            title: Text('Settings'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+                body: Column(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: app.proxyRunning
+                              ? () => app.openInTelegram()
+                              : null,
+                          icon: const Icon(Icons.send),
+                          label: const Text('Import Proxy to Telegram'),
+                          style: ElevatedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(vertical: 16),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: app.workers.isEmpty
+                          ? const Center(
+                              child: Text(
+                                  'No workers imported.\nUse the menu to import.'))
+                          : ListView.builder(
+                              itemCount: app.workers.length,
+                              itemBuilder: (_, i) {
+                                final w = app.workers[i];
+                                return WorkerTile(
+                                  worker: w,
+                                  isSelected: app.selectedWorker == w,
+                                  onTap: () => app.selectWorker(w),
+                                  onRemove: () => app.removeWorker(w),
+                                  onCopy: () => app.copyWorkerUrl(w),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+                bottomNavigationBar: BottomStatusBar(
+                  status: app.proxyStatus,
+                  isRunning: app.proxyRunning,
+                  activeConnections: app.activeConnections,
+                  onToggle: app.toggleProxy,
+                ),
+              );
+            }
+          }
+          DART
+
+          # ---------- screens/log_screen.dart ----------
+          cat <<'DART' > lib/screens/log_screen.dart
+          import 'package:flutter/material.dart';
+          import 'package:provider/provider.dart';
+          import '../providers/app_state.dart';
+
+          class LogScreen extends StatelessWidget {
+            const LogScreen({super.key});
+
             @override
             Widget build(BuildContext context) {
               final app = context.watch<AppState>();
               return Scaffold(
-                key: _scaffoldKey,
-                appBar: AppBar(title: const Text('TG WS Proxy'), centerTitle: true, actions: [
-                  IconButton(icon: const Icon(Icons.menu), onPressed: () => _scaffoldKey.currentState?.openEndDrawer()),
-                ]),
-                endDrawer: Drawer(child: ListView(padding: EdgeInsets.zero, children: [
-                  const DrawerHeader(decoration: BoxDecoration(color: Colors.blue), child: Text('Menu', style: TextStyle(color: Colors.white, fontSize: 24))),
-                  ListTile(leading: const Icon(Icons.content_paste), title: const Text('Import worker by clipboard'), onTap: () { app.importWorkerFromClipboard(); Navigator.pop(context); }),
-                  ListTile(leading: const Icon(Icons.terminal), title: const Text('Logs'), onTap: () { Navigator.pop(context); _showLogs(context); }),
-                  const Divider(),
-                  ListTile(leading: const Icon(Icons.cleaning_services), title: const Text('Clear Logs'), onTap: () { app.clearLogs(); Navigator.pop(context); }),
-                ])),
-                body: Column(children: [
-                  Padding(padding: const EdgeInsets.all(16), child: SizedBox(width: double.infinity, child: ElevatedButton.icon(
-                    onPressed: app.proxyRunning ? () => app.openInTelegram() : null,
-                    icon: const Icon(Icons.send), label: const Text('Import Proxy to Telegram'),
-                    style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 16)),
-                  ))),
-                  Expanded(child: app.workers.isEmpty
-                    ? const Center(child: Text('No workers imported.\nUse the menu to import.'))
-                    : ListView.builder(itemCount: app.workers.length, itemBuilder: (_, i) {
-                        final w = app.workers[i];
-                        return WorkerTile(worker: w, isSelected: app.selectedWorker == w, onTap: () => app.selectWorker(w), onRemove: () => app.removeWorker(w));
-                      })),
-                ]),
-                bottomNavigationBar: BottomStatusBar(status: app.proxyStatus, isRunning: app.proxyRunning, activeConnections: app.activeConnections, onToggle: app.toggleProxy),
+                appBar: AppBar(
+                  title: const Text('Logs'),
+                  actions: [
+                    IconButton(
+                      icon: const Icon(Icons.cleaning_services),
+                      onPressed: () => app.clearLogs(),
+                      tooltip: 'Clear Logs',
+                    ),
+                  ],
+                ),
+                body: app.logs.isEmpty
+                    ? const Center(child: Text('No logs'))
+                    : ListView.builder(
+                        itemCount: app.logs.length,
+                        itemBuilder: (_, i) => Text(
+                          app.logs[i],
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                      ),
               );
-            }
-            void _showLogs(BuildContext context) {
-              final app = context.read<AppState>();
-              showDialog(context: context, builder: (_) => AlertDialog(title: const Text('Logs'), content: SizedBox(width: double.maxFinite, child: ListView.builder(
-                shrinkWrap: true, itemCount: app.logs.length, itemBuilder: (_, i) => Text(app.logs[i], style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
-              )), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close'))]));
             }
           }
           DART
 
-          # worker_tile.dart
+          # ---------- widgets/worker_tile.dart ----------
           cat <<'DART' > lib/widgets/worker_tile.dart
           import 'package:flutter/material.dart';
           import '../models/worker.dart';
+
           class WorkerTile extends StatelessWidget {
-            final Worker worker; final bool isSelected; final VoidCallback onTap; final VoidCallback onRemove;
-            const WorkerTile({super.key, required this.worker, required this.isSelected, required this.onTap, required this.onRemove});
+            final Worker worker;
+            final bool isSelected;
+            final VoidCallback onTap;
+            final VoidCallback onRemove;
+            final VoidCallback onCopy;
+
+            const WorkerTile({
+              super.key,
+              required this.worker,
+              required this.isSelected,
+              required this.onTap,
+              required this.onRemove,
+              required this.onCopy,
+            });
+
             @override
-            Widget build(BuildContext context) => Card(color: isSelected ? Colors.blue.withOpacity(0.2) : null, child: ListTile(
-              title: Text(worker.url, overflow: TextOverflow.ellipsis),
-              subtitle: Text('Requests: ${worker.requestCount}/${worker.maxRequests}', style: const TextStyle(fontSize: 12)),
-              trailing: IconButton(icon: const Icon(Icons.close), onPressed: onRemove),
-              onTap: onTap,
-            ));
+            Widget build(BuildContext context) {
+              final pingText = worker.isOnline
+                  ? '${worker.pingLatency} ms'
+                  : '-1 ms (inactive)';
+              final pingColor = worker.isOnline ? Colors.green : Colors.red;
+
+              return Card(
+                color: isSelected ? Colors.blue.withOpacity(0.2) : null,
+                child: ListTile(
+                  title: Text(worker.url, overflow: TextOverflow.ellipsis),
+                  subtitle: Row(
+                    children: [
+                      Text(
+                        'Requests: ${worker.requestCount}/${worker.maxRequests}',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                      const SizedBox(width: 12),
+                      Text(
+                        'Ping: $pingText',
+                        style: TextStyle(fontSize: 12, color: pingColor),
+                      ),
+                    ],
+                  ),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.copy, size: 20),
+                        onPressed: onCopy,
+                        tooltip: 'Copy URL',
+                      ),
+                      IconButton(
+                        icon:
+                            const Icon(Icons.close, size: 20, color: Colors.red),
+                        onPressed: onRemove,
+                        tooltip: 'Remove worker',
+                      ),
+                    ],
+                  ),
+                  onTap: onTap,
+                ),
+              );
+            }
           }
           DART
 
-          # bottom_status_bar.dart
+          # ---------- widgets/bottom_status_bar.dart ----------
           cat <<'DART' > lib/widgets/bottom_status_bar.dart
           import 'package:flutter/material.dart';
+
           class BottomStatusBar extends StatelessWidget {
-            final String status; final bool isRunning; final int activeConnections; final VoidCallback onToggle;
-            const BottomStatusBar({super.key, required this.status, required this.isRunning, required this.activeConnections, required this.onToggle});
+            final String status;
+            final bool isRunning;
+            final int activeConnections;
+            final VoidCallback onToggle;
+
+            const BottomStatusBar({
+              super.key,
+              required this.status,
+              required this.isRunning,
+              required this.activeConnections,
+              required this.onToggle,
+            });
+
             @override
-            Widget build(BuildContext context) => Container(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8), decoration: BoxDecoration(
-              color: Theme.of(context).colorScheme.surfaceContainerHighest, border: Border(top: BorderSide(color: Theme.of(context).dividerColor))),
-              child: Row(children: [
-                Icon(isRunning ? Icons.check_circle : Icons.error, color: isRunning ? Colors.green : Colors.red, size: 20),
-                const SizedBox(width: 8),
-                Expanded(child: Text('$status (${activeConnections} connections)', style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant))),
-                IconButton(onPressed: onToggle, icon: Icon(isRunning ? Icons.pause : Icons.play_arrow, color: isRunning ? Colors.orange : Colors.green), tooltip: isRunning ? 'Stop Proxy' : 'Start Proxy'),
-              ]));
+            Widget build(BuildContext context) {
+              return Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                  border: Border(
+                    top: BorderSide(color: Theme.of(context).dividerColor),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      isRunning ? Icons.check_circle : Icons.error,
+                      color: isRunning ? Colors.green : Colors.red,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        '$status (${activeConnections} connections)',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color:
+                              Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: onToggle,
+                      icon: Icon(
+                        isRunning ? Icons.pause : Icons.play_arrow,
+                        color: isRunning ? Colors.orange : Colors.green,
+                      ),
+                      tooltip: isRunning ? 'Stop Proxy' : 'Start Proxy',
+                    ),
+                  ],
+                ),
+              );
+            }
           }
           DART
 
-          # main.dart
+          # ---------- main.dart ----------
           cat <<'DART' > lib/main.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
@@ -337,26 +805,35 @@ jobs:
           import 'services/clipboard_service.dart';
           import 'services/mtproto_proxy_server.dart';
           import 'services/telegram_service.dart';
+          import 'services/ping_service.dart';
 
           void main() {
             runApp(MultiProvider(providers: [
               Provider<ClipboardService>(create: (_) => ClipboardService()),
               Provider<TelegramService>(create: (_) => TelegramService()),
+              Provider<PingService>(create: (_) => PingService()),
               Provider<MtprotoProxyServer>(create: (_) => MtprotoProxyServer()),
               ChangeNotifierProvider<AppState>(create: (ctx) => AppState(
                 proxyServer: ctx.read<MtprotoProxyServer>(),
                 clipboardService: ctx.read<ClipboardService>(),
                 telegramService: ctx.read<TelegramService>(),
+                pingService: ctx.read<PingService>(),
               )),
             ], child: const MyApp()));
           }
 
           class MyApp extends StatelessWidget {
             const MyApp({super.key});
+
             @override
             Widget build(BuildContext context) => MaterialApp(
-              title: 'TG WS Proxy', debugShowCheckedModeBanner: false,
-              theme: ThemeData(colorSchemeSeed: Colors.blue, useMaterial3: true, brightness: Brightness.dark),
+              title: 'TG WS Proxy',
+              debugShowCheckedModeBanner: false,
+              theme: ThemeData(
+                colorSchemeSeed: Colors.blue,
+                useMaterial3: true,
+                brightness: Brightness.dark,
+              ),
               home: const HomeScreen(),
             );
           }
@@ -532,7 +1009,7 @@ jobs:
           name: windows-zip
           path: release-artifacts/
 
-  # ─────────── Create GitHub Release (always, even if some builds fail) ───────────
+  # ─────────── GitHub Release (always runs) ───────────
   github-release:
     needs: [build-android, build-linux, build-macos, build-windows]
     if: always() && !cancelled()
