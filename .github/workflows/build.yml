@@ -93,26 +93,26 @@ jobs:
           }
           DART
 
-          # ---------- services/ping_service.dart (FIXED) ----------
+          # ---------- services/ping_service.dart (TCP‑based fix) ----------
           cat <<'DART' > lib/services/ping_service.dart
           import 'dart:async';
           import 'dart:io';
 
           class PingService {
+            /// Latency via pure TCP connect to the host:port – always works
             Future<int> ping(String url) async {
-              final httpUrl = url
-                  .replaceFirst('wss://', 'https://')
-                  .replaceFirst('ws://', 'http://');
               try {
+                final uri = Uri.parse(url);
+                final host = uri.host;
+                final port = uri.scheme == 'https' ? 443 : (uri.port != 0 ? uri.port : 80);
                 final sw = Stopwatch()..start();
-                final client = HttpClient()
-                  ..connectionTimeout = const Duration(seconds: 6);
-                final req = await client
-                    .openUrl('HEAD', Uri.parse(httpUrl))
-                    .timeout(const Duration(seconds: 6));
-                await req.close().timeout(const Duration(seconds: 6));
+                final socket = await Socket.connect(
+                  host,
+                  port,
+                  timeout: const Duration(seconds: 6),
+                );
+                socket.destroy();
                 sw.stop();
-                client.close();
                 return sw.elapsedMilliseconds;
               } on TimeoutException {
                 return -1;
@@ -123,7 +123,7 @@ jobs:
           }
           DART
 
-          # ---------- services/telegram_service.dart (FIXED) ----------
+          # ---------- services/telegram_service.dart ----------
           cat <<'DART' > lib/services/telegram_service.dart
           import 'package:url_launcher/url_launcher.dart';
 
@@ -279,7 +279,7 @@ jobs:
           }
           DART
 
-          # ---------- providers/app_state.dart (FIXED) ----------
+          # ---------- providers/app_state.dart ----------
           cat <<'DART' > lib/providers/app_state.dart
           import 'dart:math';
           import 'package:flutter/foundation.dart';
@@ -355,7 +355,7 @@ jobs:
                 _addLog('Imported worker');
                 notifyListeners();
 
-                // Auto-ping with HTTP fallback
+                // Auto‑ping via TCP
                 final latency = await pingService.ping(worker.url);
                 worker.pingLatency = latency;
                 worker.isOnline = latency != -1;
