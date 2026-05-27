@@ -102,14 +102,9 @@ jobs:
               required String server,
               required int port,
             }) async {
-              final uri = Uri(
-                scheme: 'tg',
-                host: 'proxy',
-                queryParameters: {
-                  'server': server,
-                  'port': port.toString(),
-                  'secret': '',
-                },
+              // Fixed deep‑link format: tg:proxy?server=...&port=...&secret=...
+              final uri = Uri.parse(
+                'tg:proxy?server=$server&port=$port&secret=',
               );
               if (await canLaunchUrl(uri)) {
                 return launchUrl(uri, mode: LaunchMode.externalApplication);
@@ -351,8 +346,17 @@ jobs:
             Future<void> importWorkerFromClipboard() async {
               final text = await clipboardService.getClipboardData();
               if (text != null && text.isNotEmpty) {
-                _workers.add(Worker(id: const Uuid().v4(), url: text.trim()));
+                final worker = Worker(id: const Uuid().v4(), url: text.trim());
+                _workers.add(worker);
                 _addLog('Imported worker');
+                notifyListeners();
+
+                // Auto‑ping the new worker immediately
+                final latency = await pingService.ping(worker.url);
+                worker.pingLatency = latency;
+                worker.isOnline = latency != -1;
+                _addLog(
+                    '${worker.url} -> ${worker.isOnline ? "${latency}ms" : "OFFLINE"}');
                 notifyListeners();
               }
             }
@@ -857,7 +861,7 @@ jobs:
           </dict></plist>
           PLIST
 
-          # ========== 🔥 FIX: macOS entitlements for network server ==========
+          # ========== macOS entitlements for network server ==========
           cat <<'ENTITLEMENTS' > macos/Runner/Release.entitlements
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -873,7 +877,6 @@ jobs:
           </plist>
           ENTITLEMENTS
 
-          # Also copy to DebugProfile.entitlements (for completeness)
           cp macos/Runner/Release.entitlements macos/Runner/DebugProfile.entitlements
 
           cd ..
@@ -1031,7 +1034,7 @@ jobs:
   # ─────────── 🚀 CREATE GITHUB RELEASE AUTOMATICALLY ───────────
   github-release:
     needs: [build-android, build-linux, build-macos, build-windows]
-    if: always() && !cancelled()   # even if a build fails, make a release with available files
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - name: Download all available artifacts
