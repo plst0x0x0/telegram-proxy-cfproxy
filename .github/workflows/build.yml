@@ -60,10 +60,10 @@ jobs:
           cat <<'DART' > lib/models/worker.dart
           class Worker {
             final String id;
-            final String url;
+            final String url;   // original https://... URL
             int requestCount;
             final int maxRequests;
-            int pingLatency;   // ms, -1 = inactive
+            int pingLatency;    // ms, -1 = inactive
             bool isOnline;
 
             Worker({
@@ -74,6 +74,16 @@ jobs:
               this.pingLatency = -1,
               this.isOnline = false,
             });
+
+            /// Returns the WebSocket‑compatible URL (wss:// or ws://)
+            String get wsUrl {
+              if (url.startsWith('https://')) {
+                return url.replaceFirst('https://', 'wss://');
+              } else if (url.startsWith('http://')) {
+                return url.replaceFirst('http://', 'ws://');
+              }
+              return url;
+            }
           }
           DART
 
@@ -98,13 +108,14 @@ jobs:
           import 'package:url_launcher/url_launcher.dart';
 
           class TelegramService {
+            /// Open Telegram proxy settings with the given MTProto parameters.
             Future<bool> openTelegramProxySettings({
               required String server,
               required int port,
+              String secret = '',
             }) async {
-              // Fixed deep‑link format: tg:proxy?server=...&port=...&secret=...
               final uri = Uri.parse(
-                'tg:proxy?server=$server&port=$port&secret=',
+                'tg://proxy?server=$server&port=$port&secret=$secret',
               );
               if (await canLaunchUrl(uri)) {
                 return launchUrl(uri, mode: LaunchMode.externalApplication);
@@ -203,35 +214,25 @@ jobs:
                   return;
                 }
                 final remainingData = handshake.sublist(20);
-                final wsChannel =
-                    WebSocketChannel.connect(Uri.parse(_activeWorker!.url));
+                // Use worker.wsUrl to guarantee a WebSocket URI
+                final wsChannel = WebSocketChannel.connect(
+                  Uri.parse(_activeWorker!.wsUrl),
+                );
                 final wsSink = wsChannel.sink;
                 final wsStream = wsChannel.stream;
                 if (remainingData.isNotEmpty) wsSink.add(remainingData);
                 final socketToWs = clientSocket.listen(
-                  (data) {
-                    wsSink.add(data);
-                  },
-                  onDone: () {
-                    wsSink.close();
-                  },
-                  onError: (e) {
-                    wsSink.close();
-                  },
+                  (data) { wsSink.add(data); },
+                  onDone: () { wsSink.close(); },
+                  onError: (e) { wsSink.close(); },
                   cancelOnError: true,
                 );
                 final wsToSocket = wsStream.listen(
                   (data) {
-                    try {
-                      clientSocket.add(data);
-                    } catch (_) {}
+                    try { clientSocket.add(data); } catch (_) {}
                   },
-                  onDone: () {
-                    clientSocket.destroy();
-                  },
-                  onError: (e) {
-                    clientSocket.destroy();
-                  },
+                  onDone: () { clientSocket.destroy(); },
+                  onError: (e) { clientSocket.destroy(); },
                   cancelOnError: true,
                 );
                 _connectionSubscriptions.add(socketToWs);
@@ -245,9 +246,7 @@ jobs:
               } finally {
                 _activeConnections--;
                 _connectionsController.add(_activeConnections);
-                try {
-                  clientSocket.destroy();
-                } catch (_) {}
+                try { clientSocket.destroy(); } catch (_) {}
               }
             }
 
@@ -267,13 +266,20 @@ jobs:
           cat <<'DART' > lib/services/ping_service.dart
           import 'dart:async';
           import 'package:web_socket_channel/web_socket_channel.dart';
+          import '../models/worker.dart';
 
           class PingService {
             /// Returns latency in milliseconds, or -1 if failed.
             Future<int> ping(String url) async {
               try {
+                // Convert https -> wss for WebSocket
+                final wsUrl = url.startsWith('https://')
+                    ? url.replaceFirst('https://', 'wss://')
+                    : url.startsWith('http://')
+                        ? url.replaceFirst('http://', 'ws://')
+                        : url;
                 final stopwatch = Stopwatch()..start();
-                final channel = WebSocketChannel.connect(Uri.parse(url));
+                final channel = WebSocketChannel.connect(Uri.parse(wsUrl));
                 await channel.ready;
                 stopwatch.stop();
                 await channel.sink.close();
@@ -351,7 +357,7 @@ jobs:
                 _addLog('Imported worker');
                 notifyListeners();
 
-                // Auto‑ping the new worker immediately
+                // Auto‑ping the new worker with ws conversion
                 final latency = await pingService.ping(worker.url);
                 worker.pingLatency = latency;
                 worker.isOnline = latency != -1;
@@ -861,7 +867,7 @@ jobs:
           </dict></plist>
           PLIST
 
-          # ========== macOS entitlements for network server ==========
+          # macOS entitlements
           cat <<'ENTITLEMENTS' > macos/Runner/Release.entitlements
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
