@@ -857,6 +857,25 @@ jobs:
           </dict></plist>
           PLIST
 
+          # ========== 🔥 FIX: macOS entitlements for network server ==========
+          cat <<'ENTITLEMENTS' > macos/Runner/Release.entitlements
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>com.apple.security.app-sandbox</key>
+          	<true/>
+          	<key>com.apple.security.network.client</key>
+          	<true/>
+          	<key>com.apple.security.network.server</key>
+          	<true/>
+          </dict>
+          </plist>
+          ENTITLEMENTS
+
+          # Also copy to DebugProfile.entitlements (for completeness)
+          cp macos/Runner/Release.entitlements macos/Runner/DebugProfile.entitlements
+
           cd ..
           echo "path=$(pwd)/tg_ws_proxy" >> $GITHUB_OUTPUT
 
@@ -1009,10 +1028,10 @@ jobs:
           name: windows-zip
           path: release-artifacts/
 
-  # ─────────── GitHub Release (always runs) ───────────
+  # ─────────── 🚀 CREATE GITHUB RELEASE AUTOMATICALLY ───────────
   github-release:
     needs: [build-android, build-linux, build-macos, build-windows]
-    if: always() && !cancelled()
+    if: always() && !cancelled()   # even if a build fails, make a release with available files
     runs-on: ubuntu-latest
     steps:
       - name: Download all available artifacts
