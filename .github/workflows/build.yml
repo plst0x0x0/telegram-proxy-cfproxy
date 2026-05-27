@@ -63,30 +63,20 @@ jobs:
             final String url;
             int requestCount;
             final int maxRequests;
-            int pingLatency;   // ms, -1 = inactive
+            int pingLatency;
             bool isOnline;
-
-            Worker({
-              required this.id,
-              required this.url,
-              this.requestCount = 0,
-              this.maxRequests = 100000,
-              this.pingLatency = -1,
-              this.isOnline = false,
-            });
+            Worker({required this.id, required this.url, this.requestCount = 0, this.maxRequests = 100000, this.pingLatency = -1, this.isOnline = false});
           }
           DART
 
           # ---------- services/clipboard_service.dart ----------
           cat <<'DART' > lib/services/clipboard_service.dart
           import 'package:flutter/services.dart';
-
           class ClipboardService {
             Future<String?> getClipboardData() async {
               final data = await Clipboard.getData('text/plain');
               return data?.text;
             }
-
             Future<void> setClipboardData(String text) async {
               await Clipboard.setData(ClipboardData(text: text));
             }
@@ -97,7 +87,6 @@ jobs:
           cat <<'DART' > lib/services/ping_service.dart
           import 'dart:async';
           import 'dart:io';
-
           class PingService {
             Future<int> ping(String url) async {
               try {
@@ -105,11 +94,7 @@ jobs:
                 final host = uri.host;
                 final port = uri.scheme == 'https' ? 443 : (uri.port != 0 ? uri.port : 80);
                 final sw = Stopwatch()..start();
-                final socket = await Socket.connect(
-                  host,
-                  port,
-                  timeout: const Duration(seconds: 6),
-                );
+                final socket = await Socket.connect(host, port, timeout: const Duration(seconds: 6));
                 socket.destroy();
                 sw.stop();
                 return sw.elapsedMilliseconds;
@@ -125,15 +110,9 @@ jobs:
           # ---------- services/telegram_service.dart ----------
           cat <<'DART' > lib/services/telegram_service.dart
           import 'package:url_launcher/url_launcher.dart';
-
           class TelegramService {
-            Future<bool> openTelegramProxySettings({
-              required String server,
-              required int port,
-            }) async {
-              final uri = Uri.parse(
-                'tg://socks?server=$server&port=$port',
-              );
+            Future<bool> openTelegramProxySettings({required String server, required int port}) async {
+              final uri = Uri.parse('tg://socks?server=$server&port=$port');
               if (await canLaunchUrl(uri)) {
                 return launchUrl(uri, mode: LaunchMode.externalApplication);
               }
@@ -157,10 +136,8 @@ jobs:
             int _activeConnections = 0;
             String _bindHost = '127.0.0.1';
             int _bindPort = 1080;
-            final StreamController<String> _statusController =
-                StreamController<String>.broadcast();
-            final StreamController<int> _connectionsController =
-                StreamController<int>.broadcast();
+            final StreamController<String> _statusController = StreamController<String>.broadcast();
+            final StreamController<int> _connectionsController = StreamController<int>.broadcast();
             final List<Worker> _workers = [];
             Worker? _activeWorker;
             final List<StreamSubscription> _connectionSubscriptions = [];
@@ -181,16 +158,11 @@ jobs:
               _workers.clear();
               _workers.addAll(workers);
             }
-
-            void setActiveWorker(Worker? worker) {
-              _activeWorker = worker;
-            }
+            void setActiveWorker(Worker? worker) { _activeWorker = worker; }
 
             Future<void> start() async {
               if (_isRunning) return;
-              if (_activeWorker == null && _workers.isNotEmpty) {
-                _activeWorker = _workers.first;
-              }
+              if (_activeWorker == null && _workers.isNotEmpty) _activeWorker = _workers.first;
               if (_activeWorker == null) {
                 _updateStatus('No active worker configured');
                 return;
@@ -207,14 +179,12 @@ jobs:
 
             Future<void> stop() async {
               if (!_isRunning) return;
+              _isRunning = false;
               await _server?.close();
               _server = null;
-              _isRunning = false;
               _activeConnections = 0;
               _connectionsController.add(0);
-              for (final sub in _connectionSubscriptions) {
-                sub.cancel();
-              }
+              for (final sub in _connectionSubscriptions) sub.cancel();
               _connectionSubscriptions.clear();
               _updateStatus('Stopped');
             }
@@ -225,31 +195,24 @@ jobs:
               try {
                 // ----- SOCKS5 greeting -----
                 final greeting = await clientSocket.first;
-                if (greeting.length < 3 || greeting[0] != 0x05) {
-                  clientSocket.destroy();
-                  return;
-                }
-                clientSocket.add(Uint8List.fromList([0x05, 0x00])); // no auth
+                if (greeting.length < 3 || greeting[0] != 0x05) { clientSocket.destroy(); return; }
+                clientSocket.add(Uint8List.fromList([0x05, 0x00]));
 
                 // ----- SOCKS5 request -----
                 final request = await clientSocket.first;
-                if (request.length < 10 || request[0] != 0x05 || request[1] != 0x01) {
-                  clientSocket.destroy();
-                  return;
-                }
+                if (request.length < 10 || request[0] != 0x05 || request[1] != 0x01) { clientSocket.destroy(); return; }
+                final targetAddr = request.sublist(3); // keep full address + port
 
                 // ----- Establish WebSocket to worker FIRST -----
                 final wsChannel = WebSocketChannel.connect(Uri.parse(_activeWorker!.url));
-                await wsChannel.ready;   // wait until WebSocket is open
+                await wsChannel.ready;
 
-                // ----- Now reply success to SOCKS5 client -----
-                clientSocket.add(Uint8List.fromList(
-                    [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+                // ----- Reply success with the original target address/port -----
+                clientSocket.add(Uint8List.fromList([0x05, 0x00, 0x00] + targetAddr));
 
                 // ----- Bidirectional relay -----
                 final wsSink = wsChannel.sink;
                 final wsStream = wsChannel.stream;
-
                 final socketToWs = clientSocket.listen(
                   (data) { wsSink.add(data); },
                   onDone: () { wsSink.close(); },
@@ -257,24 +220,17 @@ jobs:
                   cancelOnError: true,
                 );
                 final wsToSocket = wsStream.listen(
-                  (data) {
-                    try { clientSocket.add(data); } catch (_) {}
-                  },
+                  (data) { try { clientSocket.add(data); } catch (_) {} },
                   onDone: () { clientSocket.destroy(); },
                   onError: (e) { clientSocket.destroy(); },
                   cancelOnError: true,
                 );
                 _connectionSubscriptions.add(socketToWs);
                 _connectionSubscriptions.add(wsToSocket);
-                await Future.any([
-                  socketToWs.asFuture<void>(),
-                  wsToSocket.asFuture<void>(),
-                ]);
+                await Future.any([socketToWs.asFuture<void>(), wsToSocket.asFuture<void>()]);
               } catch (e) {
-                // WebSocket or socket error – send SOCKS5 failure if possible
                 try {
-                  clientSocket.add(Uint8List.fromList(
-                      [0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+                  clientSocket.add(Uint8List.fromList([0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
                 } catch (_) {}
               } finally {
                 _activeConnections--;
@@ -310,7 +266,6 @@ jobs:
             final ClipboardService clipboardService;
             final TelegramService telegramService;
             final PingService pingService;
-
             List<Worker> _workers = [];
             Worker? _selectedWorker;
             bool _proxyRunning = false;
@@ -318,19 +273,13 @@ jobs:
             final List<String> _logs = [];
             int _activeConnections = 0;
 
-            AppState({
-              required this.proxyServer,
-              required this.clipboardService,
-              required this.telegramService,
-              required this.pingService,
-            }) {
+            AppState({required this.proxyServer, required this.clipboardService, required this.telegramService, required this.pingService}) {
               proxyServer.statusStream.listen((status) {
                 _proxyStatus = status;
                 _proxyRunning = proxyServer.isRunning;
                 if (status.startsWith('Error')) _addLog('Error: $status');
                 notifyListeners();
               });
-
               proxyServer.connectionsStream.listen((count) {
                 _activeConnections = count;
                 notifyListeners();
@@ -343,7 +292,6 @@ jobs:
             String get proxyStatus => _proxyStatus;
             List<String> get logs => _logs;
             int get activeConnections => _activeConnections;
-
             String get bindHost => proxyServer.bindHost;
             int get bindPort => proxyServer.bindPort;
 
@@ -360,55 +308,27 @@ jobs:
                 _workers.add(worker);
                 _addLog('Imported worker');
                 notifyListeners();
-
                 final latency = await pingService.ping(worker.url);
                 worker.pingLatency = latency;
                 worker.isOnline = latency != -1;
-                _addLog(
-                    '${worker.url} -> ${worker.isOnline ? "${latency}ms" : "OFFLINE"}');
+                _addLog('${worker.url} -> ${worker.isOnline ? "${latency}ms" : "OFFLINE"}');
                 notifyListeners();
               }
             }
-
-            void selectWorker(Worker w) {
-              _selectedWorker = w;
-              _addLog('Selected ${w.url}');
-              notifyListeners();
-            }
-
-            void removeWorker(Worker w) {
-              _workers.remove(w);
-              if (_selectedWorker == w) _selectedWorker = null;
-              _addLog('Removed ${w.url}');
-              notifyListeners();
-            }
-
-            Future<void> copyWorkerUrl(Worker w) async {
-              await clipboardService.setClipboardData(w.url);
-              _addLog('Copied URL: ${w.url}');
-              notifyListeners();
-            }
-
-            Future<void> copyAllWorkers() async {
-              if (_workers.isEmpty) return;
-              final all = _workers.map((w) => w.url).join('\n');
-              await clipboardService.setClipboardData(all);
-              _addLog('Copied all worker URLs');
-              notifyListeners();
-            }
-
+            void selectWorker(Worker w) { _selectedWorker = w; _addLog('Selected ${w.url}'); notifyListeners(); }
+            void removeWorker(Worker w) { _workers.remove(w); if (_selectedWorker == w) _selectedWorker = null; _addLog('Removed ${w.url}'); notifyListeners(); }
+            Future<void> copyWorkerUrl(Worker w) async { await clipboardService.setClipboardData(w.url); _addLog('Copied URL: ${w.url}'); notifyListeners(); }
+            Future<void> copyAllWorkers() async { if (_workers.isEmpty) return; final all = _workers.map((w) => w.url).join('\n'); await clipboardService.setClipboardData(all); _addLog('Copied all worker URLs'); notifyListeners(); }
             Future<void> pingAll() async {
               _addLog('Pinging all workers...');
               for (var w in _workers) {
                 final latency = await pingService.ping(w.url);
                 w.pingLatency = latency;
                 w.isOnline = latency != -1;
-                _addLog(
-                    '${w.url} -> ${w.isOnline ? "${latency}ms" : "OFFLINE"}');
+                _addLog('${w.url} -> ${w.isOnline ? "${latency}ms" : "OFFLINE"}');
               }
               notifyListeners();
             }
-
             Future<void> toggleProxy() async {
               if (_proxyRunning) {
                 await proxyServer.stop();
@@ -421,35 +341,18 @@ jobs:
               }
               notifyListeners();
             }
-
             Future<void> openInTelegram() async {
-              final ok = await telegramService.openTelegramProxySettings(
-                server: bindHost,
-                port: bindPort,
-              );
+              final ok = await telegramService.openTelegramProxySettings(server: bindHost, port: bindPort);
               _addLog(ok ? 'Opened Telegram' : 'Failed to open Telegram');
             }
-
-            void clearLogs() {
-              _logs.clear();
-              notifyListeners();
-            }
-
-            void _addLog(String msg) {
-              _logs.add('[${DateTime.now().toIso8601String()}] $msg');
-              if (_logs.length > 100) _logs.removeAt(0);
-              notifyListeners();
-            }
-
+            void clearLogs() { _logs.clear(); notifyListeners(); }
+            void _addLog(String msg) { _logs.add('[${DateTime.now().toIso8601String()}] $msg'); if (_logs.length > 100) _logs.removeAt(0); notifyListeners(); }
             @override
-            void dispose() {
-              proxyServer.dispose();
-              super.dispose();
-            }
+            void dispose() { proxyServer.dispose(); super.dispose(); }
           }
           DART
 
-          # ---------- screens/home_screen.dart ----------
+          # ---------- screens/home_screen.dart (unchanged) ----------
           cat <<'DART' > lib/screens/home_screen.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
@@ -717,8 +620,13 @@ jobs:
           </dict>
           </plist>
           ENTITLEMENTS
-
           cp macos/Runner/Release.entitlements macos/Runner/DebugProfile.entitlements
+
+          # ---------- Size optimizations ----------
+          # Android: enable ProGuard
+          sed -i 's/minifyEnabled false/minifyEnabled true/' android/app/build.gradle
+          sed -i '/minifyEnabled true/a\            shrinkResources true' android/app/build.gradle
+          sed -i '/defaultConfig {/a\        ndk { abiFilters "armeabi-v7a","arm64-v8a","x86_64" }' android/app/build.gradle  # optional, but helps
 
           cd ..
           echo "path=$(pwd)/tg_ws_proxy" >> $GITHUB_OUTPUT
@@ -749,11 +657,11 @@ jobs:
         with:
           name: project-source
           path: tg_ws_proxy
-      - name: Build APK
+      - name: Build APK (ProGuard applied)
         working-directory: tg_ws_proxy
         run: |
           flutter pub get
-          flutter build apk --release
+          flutter build apk --release --shrink
           mkdir -p ../release-artifacts
           cp build/app/outputs/flutter-apk/app-release.apk ../release-artifacts/tg_ws_proxy_1.0.0_android_universal.apk
       - name: Upload APK artifact
@@ -780,19 +688,16 @@ jobs:
             libxdamage-dev libxrender-dev libxtst-dev \
             libepoxy-dev libpng-dev libharfbuzz-dev \
             libfontconfig1-dev libfreetype6-dev
-
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.22.0'
           channel: 'stable'
-
       - name: Download project source
         uses: actions/download-artifact@v4
         with:
           name: project-source
           path: tg_ws_proxy
-
-      - name: Build Linux
+      - name: Build Linux (optimized)
         working-directory: tg_ws_proxy
         run: |
           flutter pub get
@@ -800,7 +705,6 @@ jobs:
           mkdir -p ../release-artifacts
           cd build/linux/x64/release/bundle
           tar -czf ../../../../../release-artifacts/tg_ws_proxy_1.0.0_linux_universal.tar.gz .
-
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
@@ -821,7 +725,7 @@ jobs:
         with:
           name: project-source
           path: tg_ws_proxy
-      - name: Build macOS and create DMG
+      - name: Build macOS and create DMG (maximum compression)
         working-directory: tg_ws_proxy
         run: |
           flutter pub get
@@ -831,7 +735,7 @@ jobs:
           mkdir dmg_mount
           cp -R "$APP_PATH" dmg_mount/
           ln -s /Applications dmg_mount/Applications
-          hdiutil create -volname "TG WS Proxy" -srcfolder dmg_mount -ov -format UDZO temp.dmg
+          hdiutil create -volname "TG WS Proxy" -srcfolder dmg_mount -ov -format UDZO -imagekey zlib-level=9 temp.dmg
           hdiutil convert temp.dmg -format UDZO -o "$DMG_NAME"
           rm -rf dmg_mount temp.dmg
           mkdir -p ../release-artifacts
@@ -856,14 +760,14 @@ jobs:
         with:
           name: project-source
           path: tg_ws_proxy
-      - name: Build Windows and create ZIP
+      - name: Build Windows and create ZIP (maximum compression)
         working-directory: tg_ws_proxy
         shell: pwsh
         run: |
           flutter pub get
           flutter build windows --release
           $zip = "tg_ws_proxy_1.0.0_windows_universal.zip"
-          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "..\$zip"
+          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "..\$zip" -CompressionLevel Optimal
           New-Item -ItemType Directory -Path ..\release-artifacts -Force
           Move-Item -Path "..\$zip" -Destination ..\release-artifacts\
       - name: Upload Windows artifact
