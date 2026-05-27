@@ -60,10 +60,10 @@ jobs:
           cat <<'DART' > lib/models/worker.dart
           class Worker {
             final String id;
-            final String url;   // original https://... URL
+            final String url;
             int requestCount;
             final int maxRequests;
-            int pingLatency;    // ms, -1 = inactive
+            int pingLatency;   // ms, -1 = inactive
             bool isOnline;
 
             Worker({
@@ -74,16 +74,6 @@ jobs:
               this.pingLatency = -1,
               this.isOnline = false,
             });
-
-            /// Returns the WebSocket‑compatible URL (wss:// or ws://)
-            String get wsUrl {
-              if (url.startsWith('https://')) {
-                return url.replaceFirst('https://', 'wss://');
-              } else if (url.startsWith('http://')) {
-                return url.replaceFirst('http://', 'ws://');
-              }
-              return url;
-            }
           }
           DART
 
@@ -103,16 +93,45 @@ jobs:
           }
           DART
 
-          # ---------- services/telegram_service.dart ----------
+          # ---------- services/ping_service.dart (FIXED) ----------
+          cat <<'DART' > lib/services/ping_service.dart
+          import 'dart:async';
+          import 'dart:io';
+
+          class PingService {
+            Future<int> ping(String url) async {
+              final httpUrl = url
+                  .replaceFirst('wss://', 'https://')
+                  .replaceFirst('ws://', 'http://');
+              try {
+                final sw = Stopwatch()..start();
+                final client = HttpClient()
+                  ..connectionTimeout = const Duration(seconds: 6);
+                final req = await client
+                    .openUrl('HEAD', Uri.parse(httpUrl))
+                    .timeout(const Duration(seconds: 6));
+                await req.close().timeout(const Duration(seconds: 6));
+                sw.stop();
+                client.close();
+                return sw.elapsedMilliseconds;
+              } on TimeoutException {
+                return -1;
+              } catch (_) {
+                return -1;
+              }
+            }
+          }
+          DART
+
+          # ---------- services/telegram_service.dart (FIXED) ----------
           cat <<'DART' > lib/services/telegram_service.dart
           import 'package:url_launcher/url_launcher.dart';
 
           class TelegramService {
-            /// Open Telegram proxy settings with the given MTProto parameters.
             Future<bool> openTelegramProxySettings({
               required String server,
               required int port,
-              String secret = '',
+              required String secret,
             }) async {
               final uri = Uri.parse(
                 'tg://proxy?server=$server&port=$port&secret=$secret',
@@ -214,10 +233,8 @@ jobs:
                   return;
                 }
                 final remainingData = handshake.sublist(20);
-                // Use worker.wsUrl to guarantee a WebSocket URI
-                final wsChannel = WebSocketChannel.connect(
-                  Uri.parse(_activeWorker!.wsUrl),
-                );
+                final wsChannel =
+                    WebSocketChannel.connect(Uri.parse(_activeWorker!.url));
                 final wsSink = wsChannel.sink;
                 final wsStream = wsChannel.stream;
                 if (remainingData.isNotEmpty) wsSink.add(remainingData);
@@ -262,37 +279,9 @@ jobs:
           }
           DART
 
-          # ---------- services/ping_service.dart ----------
-          cat <<'DART' > lib/services/ping_service.dart
-          import 'dart:async';
-          import 'package:web_socket_channel/web_socket_channel.dart';
-          import '../models/worker.dart';
-
-          class PingService {
-            /// Returns latency in milliseconds, or -1 if failed.
-            Future<int> ping(String url) async {
-              try {
-                // Convert https -> wss for WebSocket
-                final wsUrl = url.startsWith('https://')
-                    ? url.replaceFirst('https://', 'wss://')
-                    : url.startsWith('http://')
-                        ? url.replaceFirst('http://', 'ws://')
-                        : url;
-                final stopwatch = Stopwatch()..start();
-                final channel = WebSocketChannel.connect(Uri.parse(wsUrl));
-                await channel.ready;
-                stopwatch.stop();
-                await channel.sink.close();
-                return stopwatch.elapsedMilliseconds;
-              } catch (e) {
-                return -1;
-              }
-            }
-          }
-          DART
-
-          # ---------- providers/app_state.dart ----------
+          # ---------- providers/app_state.dart (FIXED) ----------
           cat <<'DART' > lib/providers/app_state.dart
+          import 'dart:math';
           import 'package:flutter/foundation.dart';
           import 'package:uuid/uuid.dart';
           import '../models/worker.dart';
@@ -313,6 +302,15 @@ jobs:
             String _proxyStatus = 'Stopped';
             final List<String> _logs = [];
             int _activeConnections = 0;
+
+            late final String _proxySecret = _generateSecret();
+
+            static String _generateSecret() {
+              final rng = Random.secure();
+              final bytes = List<int>.generate(16, (_) => rng.nextInt(256));
+              return 'dd' +
+                  bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+            }
 
             AppState({
               required this.proxyServer,
@@ -357,7 +355,7 @@ jobs:
                 _addLog('Imported worker');
                 notifyListeners();
 
-                // Auto‑ping the new worker with ws conversion
+                // Auto-ping with HTTP fallback
                 final latency = await pingService.ping(worker.url);
                 worker.pingLatency = latency;
                 worker.isOnline = latency != -1;
@@ -423,8 +421,9 @@ jobs:
               final ok = await telegramService.openTelegramProxySettings(
                 server: bindHost,
                 port: bindPort,
+                secret: _proxySecret,
               );
-              _addLog(ok ? 'Opened Telegram' : 'Failed to open Telegram');
+              _addLog(ok ? 'Opened Telegram (secret: $_proxySecret)' : 'Failed to open Telegram');
             }
 
             void clearLogs() {
@@ -458,18 +457,14 @@ jobs:
 
           class HomeScreen extends StatefulWidget {
             const HomeScreen({super.key});
-
             @override
             State<HomeScreen> createState() => _HomeScreenState();
           }
-
           class _HomeScreenState extends State<HomeScreen> {
             void _showSettings(BuildContext context) {
               final app = context.read<AppState>();
               final hostCtrl = TextEditingController(text: app.bindHost);
-              final portCtrl =
-                  TextEditingController(text: app.bindPort.toString());
-
+              final portCtrl = TextEditingController(text: app.bindPort.toString());
               showDialog(
                 context: context,
                 builder: (ctx) => AlertDialog(
@@ -477,23 +472,12 @@ jobs:
                   content: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      TextField(
-                        controller: hostCtrl,
-                        decoration: const InputDecoration(labelText: 'Bind IP'),
-                      ),
-                      TextField(
-                        controller: portCtrl,
-                        decoration:
-                            const InputDecoration(labelText: 'Bind Port'),
-                        keyboardType: TextInputType.number,
-                      ),
+                      TextField(controller: hostCtrl, decoration: const InputDecoration(labelText: 'Bind IP')),
+                      TextField(controller: portCtrl, decoration: const InputDecoration(labelText: 'Bind Port'), keyboardType: TextInputType.number),
                     ],
                   ),
                   actions: [
-                    TextButton(
-                      onPressed: () => Navigator.pop(ctx),
-                      child: const Text('Cancel'),
-                    ),
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
                     TextButton(
                       onPressed: () {
                         final host = hostCtrl.text.trim();
@@ -513,7 +497,6 @@ jobs:
             @override
             Widget build(BuildContext context) {
               final app = context.watch<AppState>();
-
               return Scaffold(
                 appBar: AppBar(
                   title: const Text('TG WS Proxy'),
@@ -523,64 +506,19 @@ jobs:
                       icon: const Icon(Icons.more_vert),
                       onSelected: (value) {
                         switch (value) {
-                          case 'import':
-                            app.importWorkerFromClipboard();
-                            break;
-                          case 'copy_all':
-                            app.copyAllWorkers();
-                            break;
-                          case 'ping_all':
-                            app.pingAll();
-                            break;
-                          case 'logs':
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) => const LogScreen(),
-                              ),
-                            );
-                            break;
-                          case 'settings':
-                            _showSettings(context);
-                            break;
+                          case 'import': app.importWorkerFromClipboard(); break;
+                          case 'copy_all': app.copyAllWorkers(); break;
+                          case 'ping_all': app.pingAll(); break;
+                          case 'logs': Navigator.push(context, MaterialPageRoute(builder: (_) => const LogScreen())); break;
+                          case 'settings': _showSettings(context); break;
                         }
                       },
                       itemBuilder: (context) => [
-                        const PopupMenuItem(
-                          value: 'import',
-                          child: ListTile(
-                            leading: Icon(Icons.content_paste),
-                            title: Text('Import worker by clipboard'),
-                          ),
-                        ),
-                        const PopupMenuItem(
-                          value: 'copy_all',
-                          child: ListTile(
-                            leading: Icon(Icons.copy_all),
-                            title: Text('Copy all workers'),
-                          ),
-                        ),
-                        const PopupMenuItem(
-                          value: 'ping_all',
-                          child: ListTile(
-                            leading: Icon(Icons.speed),
-                            title: Text('Ping all'),
-                          ),
-                        ),
-                        const PopupMenuItem(
-                          value: 'logs',
-                          child: ListTile(
-                            leading: Icon(Icons.terminal),
-                            title: Text('Logs'),
-                          ),
-                        ),
-                        const PopupMenuItem(
-                          value: 'settings',
-                          child: ListTile(
-                            leading: Icon(Icons.settings),
-                            title: Text('Settings'),
-                          ),
-                        ),
+                        const PopupMenuItem(value: 'import', child: ListTile(leading: Icon(Icons.content_paste), title: Text('Import worker by clipboard'))),
+                        const PopupMenuItem(value: 'copy_all', child: ListTile(leading: Icon(Icons.copy_all), title: Text('Copy all workers'))),
+                        const PopupMenuItem(value: 'ping_all', child: ListTile(leading: Icon(Icons.speed), title: Text('Ping all'))),
+                        const PopupMenuItem(value: 'logs', child: ListTile(leading: Icon(Icons.terminal), title: Text('Logs'))),
+                        const PopupMenuItem(value: 'settings', child: ListTile(leading: Icon(Icons.settings), title: Text('Settings'))),
                       ],
                     ),
                   ],
@@ -592,22 +530,16 @@ jobs:
                       child: SizedBox(
                         width: double.infinity,
                         child: ElevatedButton.icon(
-                          onPressed: app.proxyRunning
-                              ? () => app.openInTelegram()
-                              : null,
+                          onPressed: app.proxyRunning ? () => app.openInTelegram() : null,
                           icon: const Icon(Icons.send),
                           label: const Text('Import Proxy to Telegram'),
-                          style: ElevatedButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(vertical: 16),
-                          ),
+                          style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 16)),
                         ),
                       ),
                     ),
                     Expanded(
                       child: app.workers.isEmpty
-                          ? const Center(
-                              child: Text(
-                                  'No workers imported.\nUse the menu to import.'))
+                          ? const Center(child: Text('No workers imported.\nUse the menu to import.'))
                           : ListView.builder(
                               itemCount: app.workers.length,
                               itemBuilder: (_, i) {
@@ -640,35 +572,21 @@ jobs:
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
           import '../providers/app_state.dart';
-
           class LogScreen extends StatelessWidget {
             const LogScreen({super.key});
-
             @override
             Widget build(BuildContext context) {
               final app = context.watch<AppState>();
               return Scaffold(
                 appBar: AppBar(
                   title: const Text('Logs'),
-                  actions: [
-                    IconButton(
-                      icon: const Icon(Icons.cleaning_services),
-                      onPressed: () => app.clearLogs(),
-                      tooltip: 'Clear Logs',
-                    ),
-                  ],
+                  actions: [IconButton(icon: const Icon(Icons.cleaning_services), onPressed: () => app.clearLogs(), tooltip: 'Clear Logs')],
                 ),
                 body: app.logs.isEmpty
                     ? const Center(child: Text('No logs'))
                     : ListView.builder(
                         itemCount: app.logs.length,
-                        itemBuilder: (_, i) => Text(
-                          app.logs[i],
-                          style: const TextStyle(
-                            fontSize: 12,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
+                        itemBuilder: (_, i) => Text(app.logs[i], style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
                       ),
               );
             }
@@ -679,63 +597,26 @@ jobs:
           cat <<'DART' > lib/widgets/worker_tile.dart
           import 'package:flutter/material.dart';
           import '../models/worker.dart';
-
           class WorkerTile extends StatelessWidget {
-            final Worker worker;
-            final bool isSelected;
-            final VoidCallback onTap;
-            final VoidCallback onRemove;
-            final VoidCallback onCopy;
-
-            const WorkerTile({
-              super.key,
-              required this.worker,
-              required this.isSelected,
-              required this.onTap,
-              required this.onRemove,
-              required this.onCopy,
-            });
-
+            final Worker worker; final bool isSelected; final VoidCallback onTap; final VoidCallback onRemove; final VoidCallback onCopy;
+            const WorkerTile({super.key, required this.worker, required this.isSelected, required this.onTap, required this.onRemove, required this.onCopy});
             @override
             Widget build(BuildContext context) {
-              final pingText = worker.isOnline
-                  ? '${worker.pingLatency} ms'
-                  : '-1 ms (inactive)';
+              final pingText = worker.isOnline ? '${worker.pingLatency} ms' : '-1 ms (inactive)';
               final pingColor = worker.isOnline ? Colors.green : Colors.red;
-
               return Card(
                 color: isSelected ? Colors.blue.withOpacity(0.2) : null,
                 child: ListTile(
                   title: Text(worker.url, overflow: TextOverflow.ellipsis),
-                  subtitle: Row(
-                    children: [
-                      Text(
-                        'Requests: ${worker.requestCount}/${worker.maxRequests}',
-                        style: const TextStyle(fontSize: 12),
-                      ),
-                      const SizedBox(width: 12),
-                      Text(
-                        'Ping: $pingText',
-                        style: TextStyle(fontSize: 12, color: pingColor),
-                      ),
-                    ],
-                  ),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        icon: const Icon(Icons.copy, size: 20),
-                        onPressed: onCopy,
-                        tooltip: 'Copy URL',
-                      ),
-                      IconButton(
-                        icon:
-                            const Icon(Icons.close, size: 20, color: Colors.red),
-                        onPressed: onRemove,
-                        tooltip: 'Remove worker',
-                      ),
-                    ],
-                  ),
+                  subtitle: Row(children: [
+                    Text('Requests: ${worker.requestCount}/${worker.maxRequests}', style: const TextStyle(fontSize: 12)),
+                    const SizedBox(width: 12),
+                    Text('Ping: $pingText', style: TextStyle(fontSize: 12, color: pingColor)),
+                  ]),
+                  trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                    IconButton(icon: const Icon(Icons.copy, size: 20), onPressed: onCopy, tooltip: 'Copy URL'),
+                    IconButton(icon: const Icon(Icons.close, size: 20, color: Colors.red), onPressed: onRemove, tooltip: 'Remove worker'),
+                  ]),
                   onTap: onTap,
                 ),
               );
@@ -746,63 +627,20 @@ jobs:
           # ---------- widgets/bottom_status_bar.dart ----------
           cat <<'DART' > lib/widgets/bottom_status_bar.dart
           import 'package:flutter/material.dart';
-
           class BottomStatusBar extends StatelessWidget {
-            final String status;
-            final bool isRunning;
-            final int activeConnections;
-            final VoidCallback onToggle;
-
-            const BottomStatusBar({
-              super.key,
-              required this.status,
-              required this.isRunning,
-              required this.activeConnections,
-              required this.onToggle,
-            });
-
+            final String status; final bool isRunning; final int activeConnections; final VoidCallback onToggle;
+            const BottomStatusBar({super.key, required this.status, required this.isRunning, required this.activeConnections, required this.onToggle});
             @override
-            Widget build(BuildContext context) {
-              return Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                  border: Border(
-                    top: BorderSide(color: Theme.of(context).dividerColor),
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      isRunning ? Icons.check_circle : Icons.error,
-                      color: isRunning ? Colors.green : Colors.red,
-                      size: 20,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        '$status (${activeConnections} connections)',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color:
-                              Theme.of(context).colorScheme.onSurfaceVariant,
-                        ),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    IconButton(
-                      onPressed: onToggle,
-                      icon: Icon(
-                        isRunning ? Icons.pause : Icons.play_arrow,
-                        color: isRunning ? Colors.orange : Colors.green,
-                      ),
-                      tooltip: isRunning ? 'Stop Proxy' : 'Start Proxy',
-                    ),
-                  ],
-                ),
-              );
-            }
+            Widget build(BuildContext context) => Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              decoration: BoxDecoration(color: Theme.of(context).colorScheme.surfaceContainerHighest, border: Border(top: BorderSide(color: Theme.of(context).dividerColor))),
+              child: Row(children: [
+                Icon(isRunning ? Icons.check_circle : Icons.error, color: isRunning ? Colors.green : Colors.red, size: 20),
+                const SizedBox(width: 8),
+                Expanded(child: Text('$status (${activeConnections} connections)', style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant))),
+                IconButton(onPressed: onToggle, icon: Icon(isRunning ? Icons.pause : Icons.play_arrow, color: isRunning ? Colors.orange : Colors.green), tooltip: isRunning ? 'Stop Proxy' : 'Start Proxy'),
+              ]),
+            );
           }
           DART
 
@@ -831,19 +669,12 @@ jobs:
               )),
             ], child: const MyApp()));
           }
-
           class MyApp extends StatelessWidget {
             const MyApp({super.key});
-
             @override
             Widget build(BuildContext context) => MaterialApp(
-              title: 'TG WS Proxy',
-              debugShowCheckedModeBanner: false,
-              theme: ThemeData(
-                colorSchemeSeed: Colors.blue,
-                useMaterial3: true,
-                brightness: Brightness.dark,
-              ),
+              title: 'TG WS Proxy', debugShowCheckedModeBanner: false,
+              theme: ThemeData(colorSchemeSeed: Colors.blue, useMaterial3: true, brightness: Brightness.dark),
               home: const HomeScreen(),
             );
           }
