@@ -99,7 +99,6 @@ jobs:
           import 'dart:io';
 
           class PingService {
-            /// Latency via pure TCP connect to the host:port – always works
             Future<int> ping(String url) async {
               try {
                 final uri = Uri.parse(url);
@@ -128,7 +127,6 @@ jobs:
           import 'package:url_launcher/url_launcher.dart';
 
           class TelegramService {
-            /// Opens Telegram SOCKS5 proxy settings (works on desktop & mobile).
             Future<bool> openTelegramProxySettings({
               required String server,
               required int port,
@@ -144,7 +142,7 @@ jobs:
           }
           DART
 
-          # ---------- services/socks5_proxy_server.dart ----------
+          # ---------- services/socks5_proxy_server.dart (FIXED) ----------
           cat <<'DART' > lib/services/socks5_proxy_server.dart
           import 'dart:async';
           import 'dart:io';
@@ -225,27 +223,30 @@ jobs:
               _activeConnections++;
               _connectionsController.add(_activeConnections);
               try {
-                // SOCKS5 handshake (no auth)
-                final data = await clientSocket.first;
-                if (data.length < 3 || data[0] != 0x05) {
+                // ----- SOCKS5 greeting -----
+                final greeting = await clientSocket.first;
+                if (greeting.length < 3 || greeting[0] != 0x05) {
                   clientSocket.destroy();
                   return;
                 }
                 clientSocket.add(Uint8List.fromList([0x05, 0x00])); // no auth
 
-                // SOCKS5 request
-                final req = await clientSocket.first;
-                if (req.length < 10 || req[0] != 0x05 || req[1] != 0x01) {
+                // ----- SOCKS5 request -----
+                final request = await clientSocket.first;
+                if (request.length < 10 || request[0] != 0x05 || request[1] != 0x01) {
                   clientSocket.destroy();
                   return;
                 }
-                // Always respond with success (we don't need the real destination)
+
+                // ----- Establish WebSocket to worker FIRST -----
+                final wsChannel = WebSocketChannel.connect(Uri.parse(_activeWorker!.url));
+                await wsChannel.ready;   // wait until WebSocket is open
+
+                // ----- Now reply success to SOCKS5 client -----
                 clientSocket.add(Uint8List.fromList(
                     [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
 
-                // Connect to worker via WebSocket
-                final wsChannel =
-                    WebSocketChannel.connect(Uri.parse(_activeWorker!.url));
+                // ----- Bidirectional relay -----
                 final wsSink = wsChannel.sink;
                 final wsStream = wsChannel.stream;
 
@@ -270,7 +271,11 @@ jobs:
                   wsToSocket.asFuture<void>(),
                 ]);
               } catch (e) {
-                /* ignore */
+                // WebSocket or socket error – send SOCKS5 failure if possible
+                try {
+                  clientSocket.add(Uint8List.fromList(
+                      [0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+                } catch (_) {}
               } finally {
                 _activeConnections--;
                 _connectionsController.add(_activeConnections);
@@ -356,7 +361,6 @@ jobs:
                 _addLog('Imported worker');
                 notifyListeners();
 
-                // Auto‑ping via TCP
                 final latency = await pingService.ping(worker.url);
                 worker.pingLatency = latency;
                 worker.isOnline = latency != -1;
