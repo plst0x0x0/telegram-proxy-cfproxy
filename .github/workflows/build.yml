@@ -1,0 +1,499 @@
+name: Build All Platforms
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  # Step 1 – Generate the Flutter project once
+  setup-project:
+    runs-on: ubuntu-latest
+    outputs:
+      project-path: ${{ steps.create.outputs.path }}
+    steps:
+      - name: Create Flutter project and write source code
+        id: create
+        run: |
+          flutter create tg_ws_proxy --org com.example --platforms android,linux,macos,windows
+          cd tg_ws_proxy
+
+          # pubspec.yaml
+          cat <<YAML > pubspec.yaml
+          name: tg_ws_proxy
+          description: MTProto Proxy Manager for Telegram via Cloudflare Workers
+          publish_to: 'none'
+          version: 1.0.0.0
+
+          environment:
+            sdk: '>=3.2.0 <4.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            provider: ^6.1.2
+            web_socket_channel: ^2.4.5
+            url_launcher: ^6.3.0
+            uuid: ^4.4.2
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^4.0.0
+
+          flutter:
+            uses-material-design: true
+          YAML
+
+          mkdir -p lib/{models,services,providers,screens,widgets}
+
+          # worker.dart
+          cat <<'DART' > lib/models/worker.dart
+          class Worker {
+            final String id;
+            final String url;
+            int requestCount;
+            final int maxRequests;
+            Worker({required this.id, required this.url, this.requestCount = 0, this.maxRequests = 100000});
+          }
+          DART
+
+          # clipboard_service.dart
+          cat <<'DART' > lib/services/clipboard_service.dart
+          import 'package:flutter/services.dart';
+          class ClipboardService {
+            Future<String?> getClipboardData() async {
+              final data = await Clipboard.getData('text/plain');
+              return data?.text;
+            }
+          }
+          DART
+
+          # telegram_service.dart
+          cat <<'DART' > lib/services/telegram_service.dart
+          import 'package:url_launcher/url_launcher.dart';
+          class TelegramService {
+            Future<bool> openTelegramProxySettings({required String server, required int port}) async {
+              final uri = Uri(scheme: 'tg', host: 'proxy', queryParameters: {'server': server, 'port': port.toString(), 'secret': ''});
+              if (await canLaunchUrl(uri)) return launchUrl(uri, mode: LaunchMode.externalApplication);
+              return false;
+            }
+          }
+          DART
+
+          # mtproto_proxy_server.dart (MTProto bridge – full code as in previous answer)
+          cat <<'DART' > lib/services/mtproto_proxy_server.dart
+          import 'dart:async';
+          import 'dart:io';
+          import 'package:web_socket_channel/web_socket_channel.dart';
+          import '../models/worker.dart';
+
+          class MtprotoProxyServer {
+            ServerSocket? _server;
+            bool _isRunning = false;
+            String _status = 'Stopped';
+            int _activeConnections = 0;
+            final StreamController<String> _statusController = StreamController<String>.broadcast();
+            final StreamController<int> _connectionsController = StreamController<int>.broadcast();
+            final List<Worker> _workers = [];
+            Worker? _activeWorker;
+            final List<StreamSubscription> _connectionSubscriptions = [];
+
+            bool get isRunning => _isRunning;
+            String get status => _status;
+            Stream<String> get statusStream => _statusController.stream;
+            Stream<int> get connectionsStream => _connectionsController.stream;
+
+            void setWorkers(List<Worker> workers) { _workers.clear(); _workers.addAll(workers); }
+            void setActiveWorker(Worker? worker) { _activeWorker = worker; }
+
+            Future<void> start({String host = '127.0.0.1', int port = 8080}) async {
+              if (_isRunning) return;
+              if (_activeWorker == null && _workers.isNotEmpty) _activeWorker = _workers.first;
+              if (_activeWorker == null) { _updateStatus('No active worker configured'); return; }
+              try {
+                _server = await ServerSocket.bind(host, port);
+                _isRunning = true;
+                _updateStatus('Running (MTProto)');
+                _server!.listen(_handleConnection);
+              } catch (e) { _updateStatus('Error: $e'); }
+            }
+
+            Future<void> stop() async {
+              if (!_isRunning) return;
+              await _server?.close();
+              _server = null;
+              _isRunning = false;
+              _activeConnections = 0;
+              _connectionsController.add(0);
+              for (final sub in _connectionSubscriptions) sub.cancel();
+              _connectionSubscriptions.clear();
+              _updateStatus('Stopped');
+            }
+
+            void _handleConnection(Socket clientSocket) async {
+              _activeConnections++; _connectionsController.add(_activeConnections);
+              try {
+                final handshake = await clientSocket.fold<List<int>>(<int>[], (prev, chunk) => prev..addAll(chunk));
+                if (handshake.length < 20) { clientSocket.destroy(); return; }
+                final remainingData = handshake.sublist(20);
+                final wsChannel = WebSocketChannel.connect(Uri.parse(_activeWorker!.url));
+                final wsSink = wsChannel.sink;
+                final wsStream = wsChannel.stream;
+                if (remainingData.isNotEmpty) wsSink.add(remainingData);
+                final socketToWs = clientSocket.listen(
+                  (data) { wsSink.add(data); },
+                  onDone: () { wsSink.close(); },
+                  onError: (e) { wsSink.close(); },
+                  cancelOnError: true,
+                );
+                final wsToSocket = wsStream.listen(
+                  (data) { try { clientSocket.add(data); } catch (_) {} },
+                  onDone: () { clientSocket.destroy(); },
+                  onError: (e) { clientSocket.destroy(); },
+                  cancelOnError: true,
+                );
+                _connectionSubscriptions.add(socketToWs);
+                _connectionSubscriptions.add(wsToSocket);
+                await Future.any([socketToWs.asFuture<void>(), wsToSocket.asFuture<void>()]);
+              } catch (e) { /* ignore */ } finally {
+                _activeConnections--; _connectionsController.add(_activeConnections);
+                try { clientSocket.destroy(); } catch (_) {}
+              }
+            }
+
+            void _updateStatus(String status) { _status = status; _statusController.add(status); }
+            void dispose() { _statusController.close(); _connectionsController.close(); }
+          }
+          DART
+
+          # app_state.dart
+          cat <<'DART' > lib/providers/app_state.dart
+          import 'package:flutter/foundation.dart';
+          import 'package:uuid/uuid.dart';
+          import '../models/worker.dart';
+          import '../services/clipboard_service.dart';
+          import '../services/mtproto_proxy_server.dart';
+          import '../services/telegram_service.dart';
+
+          class AppState extends ChangeNotifier {
+            final MtprotoProxyServer proxyServer;
+            final ClipboardService clipboardService;
+            final TelegramService telegramService;
+            List<Worker> _workers = [];
+            Worker? _selectedWorker;
+            bool _proxyRunning = false;
+            String _proxyStatus = 'Stopped';
+            final List<String> _logs = [];
+            int _activeConnections = 0;
+
+            AppState({required this.proxyServer, required this.clipboardService, required this.telegramService}) {
+              proxyServer.statusStream.listen((status) {
+                _proxyStatus = status; _proxyRunning = proxyServer.isRunning;
+                if (status.startsWith('Error')) _addLog('Error: $status');
+                notifyListeners();
+              });
+              proxyServer.connectionsStream.listen((count) { _activeConnections = count; notifyListeners(); });
+            }
+
+            List<Worker> get workers => _workers;
+            Worker? get selectedWorker => _selectedWorker;
+            bool get proxyRunning => _proxyRunning;
+            String get proxyStatus => _proxyStatus;
+            List<String> get logs => _logs;
+            int get activeConnections => _activeConnections;
+
+            Future<void> importWorkerFromClipboard() async {
+              final text = await clipboardService.getClipboardData();
+              if (text != null && text.isNotEmpty) {
+                _workers.add(Worker(id: const Uuid().v4(), url: text.trim()));
+                _addLog('Imported worker');
+                notifyListeners();
+              }
+            }
+            void selectWorker(Worker w) { _selectedWorker = w; _addLog('Selected ${w.url}'); notifyListeners(); }
+            void removeWorker(Worker w) { _workers.remove(w); if (_selectedWorker == w) _selectedWorker = null; _addLog('Removed ${w.url}'); notifyListeners(); }
+            Future<void> toggleProxy() async {
+              if (_proxyRunning) { await proxyServer.stop(); _addLog('Proxy stopped'); }
+              else { proxyServer.setWorkers(_workers); proxyServer.setActiveWorker(_selectedWorker); await proxyServer.start(); _addLog('Proxy started'); }
+              notifyListeners();
+            }
+            Future<void> openInTelegram() async {
+              final ok = await telegramService.openTelegramProxySettings(server: '127.0.0.1', port: 8080);
+              _addLog(ok ? 'Opened Telegram' : 'Failed to open Telegram');
+            }
+            void clearLogs() { _logs.clear(); notifyListeners(); }
+            void _addLog(String msg) { _logs.add('[${DateTime.now().toIso8601String()}] $msg'); if (_logs.length > 100) _logs.removeAt(0); notifyListeners(); }
+            @override
+            void dispose() { proxyServer.dispose(); super.dispose(); }
+          }
+          DART
+
+          # home_screen.dart
+          cat <<'DART' > lib/screens/home_screen.dart
+          import 'package:flutter/material.dart';
+          import 'package:provider/provider.dart';
+          import '../providers/app_state.dart';
+          import '../widgets/worker_tile.dart';
+          import '../widgets/bottom_status_bar.dart';
+
+          class HomeScreen extends StatefulWidget {
+            const HomeScreen({super.key});
+            @override
+            State<HomeScreen> createState() => _HomeScreenState();
+          }
+          class _HomeScreenState extends State<HomeScreen> {
+            final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+            @override
+            Widget build(BuildContext context) {
+              final app = context.watch<AppState>();
+              return Scaffold(
+                key: _scaffoldKey,
+                appBar: AppBar(title: const Text('TG WS Proxy'), centerTitle: true, actions: [
+                  IconButton(icon: const Icon(Icons.menu), onPressed: () => _scaffoldKey.currentState?.openEndDrawer()),
+                ]),
+                endDrawer: Drawer(child: ListView(padding: EdgeInsets.zero, children: [
+                  const DrawerHeader(decoration: BoxDecoration(color: Colors.blue), child: Text('Menu', style: TextStyle(color: Colors.white, fontSize: 24))),
+                  ListTile(leading: const Icon(Icons.content_paste), title: const Text('Import worker by clipboard'), onTap: () { app.importWorkerFromClipboard(); Navigator.pop(context); }),
+                  ListTile(leading: const Icon(Icons.terminal), title: const Text('Logs'), onTap: () { Navigator.pop(context); _showLogs(context); }),
+                  const Divider(),
+                  ListTile(leading: const Icon(Icons.cleaning_services), title: const Text('Clear Logs'), onTap: () { app.clearLogs(); Navigator.pop(context); }),
+                ])),
+                body: Column(children: [
+                  Padding(padding: const EdgeInsets.all(16), child: SizedBox(width: double.infinity, child: ElevatedButton.icon(
+                    onPressed: app.proxyRunning ? () => app.openInTelegram() : null,
+                    icon: const Icon(Icons.send), label: const Text('Import Proxy to Telegram'),
+                    style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 16)),
+                  ))),
+                  Expanded(child: app.workers.isEmpty
+                    ? const Center(child: Text('No workers imported.\nUse the menu to import.'))
+                    : ListView.builder(itemCount: app.workers.length, itemBuilder: (_, i) {
+                        final w = app.workers[i];
+                        return WorkerTile(worker: w, isSelected: app.selectedWorker == w, onTap: () => app.selectWorker(w), onRemove: () => app.removeWorker(w));
+                      })),
+                ]),
+                bottomNavigationBar: BottomStatusBar(status: app.proxyStatus, isRunning: app.proxyRunning, activeConnections: app.activeConnections, onToggle: app.toggleProxy),
+              );
+            }
+            void _showLogs(BuildContext context) {
+              final app = context.read<AppState>();
+              showDialog(context: context, builder: (_) => AlertDialog(title: const Text('Logs'), content: SizedBox(width: double.maxFinite, child: ListView.builder(
+                shrinkWrap: true, itemCount: app.logs.length, itemBuilder: (_, i) => Text(app.logs[i], style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
+              )), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close'))]));
+            }
+          }
+          DART
+
+          # worker_tile.dart
+          cat <<'DART' > lib/widgets/worker_tile.dart
+          import 'package:flutter/material.dart';
+          import '../models/worker.dart';
+          class WorkerTile extends StatelessWidget {
+            final Worker worker; final bool isSelected; final VoidCallback onTap; final VoidCallback onRemove;
+            const WorkerTile({super.key, required this.worker, required this.isSelected, required this.onTap, required this.onRemove});
+            @override
+            Widget build(BuildContext context) => Card(color: isSelected ? Colors.blue.withOpacity(0.2) : null, child: ListTile(
+              title: Text(worker.url, overflow: TextOverflow.ellipsis),
+              subtitle: Text('Requests: ${worker.requestCount}/${worker.maxRequests}', style: const TextStyle(fontSize: 12)),
+              trailing: IconButton(icon: const Icon(Icons.close), onPressed: onRemove),
+              onTap: onTap,
+            ));
+          }
+          DART
+
+          # bottom_status_bar.dart
+          cat <<'DART' > lib/widgets/bottom_status_bar.dart
+          import 'package:flutter/material.dart';
+          class BottomStatusBar extends StatelessWidget {
+            final String status; final bool isRunning; final int activeConnections; final VoidCallback onToggle;
+            const BottomStatusBar({super.key, required this.status, required this.isRunning, required this.activeConnections, required this.onToggle});
+            @override
+            Widget build(BuildContext context) => Container(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8), decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surfaceContainerHighest, border: Border(top: BorderSide(color: Theme.of(context).dividerColor))),
+              child: Row(children: [
+                Icon(isRunning ? Icons.check_circle : Icons.error, color: isRunning ? Colors.green : Colors.red, size: 20),
+                const SizedBox(width: 8),
+                Expanded(child: Text('$status (${activeConnections} connections)', style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant))),
+                IconButton(onPressed: onToggle, icon: Icon(isRunning ? Icons.pause : Icons.play_arrow, color: isRunning ? Colors.orange : Colors.green), tooltip: isRunning ? 'Stop Proxy' : 'Start Proxy'),
+              ]));
+          }
+          DART
+
+          # main.dart
+          cat <<'DART' > lib/main.dart
+          import 'package:flutter/material.dart';
+          import 'package:provider/provider.dart';
+          import 'providers/app_state.dart';
+          import 'screens/home_screen.dart';
+          import 'services/clipboard_service.dart';
+          import 'services/mtproto_proxy_server.dart';
+          import 'services/telegram_service.dart';
+
+          void main() {
+            runApp(MultiProvider(providers: [
+              Provider<ClipboardService>(create: (_) => ClipboardService()),
+              Provider<TelegramService>(create: (_) => TelegramService()),
+              Provider<MtprotoProxyServer>(create: (_) => MtprotoProxyServer()),
+              ChangeNotifierProvider<AppState>(create: (ctx) => AppState(
+                proxyServer: ctx.read<MtprotoProxyServer>(),
+                clipboardService: ctx.read<ClipboardService>(),
+                telegramService: ctx.read<TelegramService>(),
+              )),
+            ], child: const MyApp()));
+          }
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+              title: 'TG WS Proxy', debugShowCheckedModeBanner: false,
+              theme: ThemeData(colorSchemeSeed: Colors.blue, useMaterial3: true, brightness: Brightness.dark),
+              home: const HomeScreen(),
+            );
+          }
+          DART
+
+          # macOS Info.plist
+          cat <<'PLIST' > macos/Runner/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleDevelopmentRegion</key><string>$(DEVELOPMENT_LANGUAGE)</string>
+            <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+            <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>TG WS Proxy</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>1.0.0</string>
+            <key>CFBundleVersion</key><string>100</string>
+            <key>LSMinimumSystemVersion</key><string>10.15</string>
+            <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
+          </dict></plist>
+          PLIST
+
+          cd ..
+          echo "path=$(pwd)/tg_ws_proxy" >> $GITHUB_OUTPUT
+
+      - name: Upload project for later jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-source
+          path: tg_ws_proxy/
+
+  # Step 2 – Build Android APK (universal) + Linux tar.gz on Ubuntu
+  build-android-linux:
+    needs: setup-project
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [apk, linux]
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+
+      - name: Download project source
+        uses: actions/download-artifact@v4
+        with:
+          name: project-source
+          path: tg_ws_proxy
+
+      - name: Build APK
+        if: matrix.target == 'apk'
+        working-directory: tg_ws_proxy
+        run: |
+          flutter pub get
+          flutter build apk --release
+          mkdir -p ../artifacts
+          cp build/app/outputs/flutter-apk/app-release.apk ../artifacts/tg_ws_proxy_1.0.0.0_android_universal.apk
+
+      - name: Build Linux
+        if: matrix.target == 'linux'
+        working-directory: tg_ws_proxy
+        run: |
+          flutter pub get
+          flutter build linux --release
+          cd build/linux/x64/release/bundle
+          tar -czf ../../../../../artifacts/tg_ws_proxy_1.0.0.0_linux_universal.tar.gz .
+          mkdir -p ../../../../../artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-linux-${{ matrix.target }}
+          path: artifacts/
+
+  # Step 3 – Build macOS DMG on macOS
+  build-macos:
+    needs: setup-project
+    runs-on: macos-latest
+    steps:
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+      - name: Download project source
+        uses: actions/download-artifact@v4
+        with:
+          name: project-source
+          path: tg_ws_proxy
+
+      - name: Build macOS and create DMG
+        working-directory: tg_ws_proxy
+        run: |
+          flutter pub get
+          flutter build macos --release
+          APP_PATH="build/macos/Build/Products/Release/tg_ws_proxy.app"
+          DMG_NAME="tg_ws_proxy_1.0.0.0_macos_universal.dmg"
+          mkdir dmg_mount
+          cp -R "$APP_PATH" dmg_mount/
+          ln -s /Applications dmg_mount/Applications
+          hdiutil create -volname "TG WS Proxy" -srcfolder dmg_mount -ov -format UDZO temp.dmg
+          hdiutil convert temp.dmg -format UDZO -o "$DMG_NAME"
+          rm -rf dmg_mount temp.dmg
+          mkdir -p ../artifacts
+          mv "$DMG_NAME" ../artifacts/
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: artifacts/
+
+  # Step 4 – Build Windows zip on Windows
+  build-windows:
+    needs: setup-project
+    runs-on: windows-latest
+    steps:
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+      - name: Download project source
+        uses: actions/download-artifact@v4
+        with:
+          name: project-source
+          path: tg_ws_proxy
+
+      - name: Build Windows and create zip
+        working-directory: tg_ws_proxy
+        shell: pwsh
+        run: |
+          flutter pub get
+          flutter build windows --release
+          $zip = "tg_ws_proxy_1.0.0.0_windows_universal.zip"
+          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "..\$zip"
+          New-Item -ItemType Directory -Path ..\artifacts -Force
+          Move-Item -Path "..\$zip" -Destination ..\artifacts\
+
+      - name: Upload Windows zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: artifacts/
