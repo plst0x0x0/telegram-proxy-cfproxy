@@ -16,7 +16,6 @@ jobs:
   build-android:
     name: Build Android App
     runs-on: ubuntu-latest
-    shell: bash
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -156,7 +155,6 @@ jobs:
     name: Build Windows App
     needs: build-android
     runs-on: windows-latest
-    shell: bash
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -168,6 +166,7 @@ jobs:
           channel: 'stable'
 
       - name: Setup Windows Environment
+        shell: bash
         run: |
           flutter config --enable-windows-desktop
           flutter create . --org com.example.tgwsproxy --project-name tg_ws_proxy --platforms windows
@@ -179,6 +178,7 @@ jobs:
           path: .
 
       - name: Extract Source and Build
+        shell: bash
         run: |
           tar -xvf shared_source.tar
           flutter pub get
@@ -202,7 +202,6 @@ jobs:
     name: Build macOS App
     needs: build-android
     runs-on: macos-latest
-    shell: bash
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
