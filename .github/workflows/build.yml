@@ -1,4 +1,4 @@
-name: Build & Release All Platforms
+name: Build & Release Multi-Platform (Android, Windows, macOS)
 
 on:
   push:
@@ -10,18 +10,12 @@ permissions:
   contents: write
 
 jobs:
-  build-android:
-    name: Build and Release Android App
+  prepare-project:
+    name: Initialize and Inject Multi-Platform Source Code
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-
-      - name: Set up Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'zulu'
-          java-version: '17'
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -29,15 +23,18 @@ jobs:
           flutter-version: '3.22.0'
           channel: 'stable'
 
-      - name: Initialize Project & Inject Source Code
+      - name: Create Framework & Inject Code
         run: |
-          # ۱. ایجاد ساختار اولیه پروژه فلاتر در دایرکتوری جاری
-          flutter create . --org com.example.tgwsproxy --project-name tg_ws_proxy --platforms android
+          # ۱. ایجاد ساختار نیتیو برای تمامی پلتفرم‌های مدنظر
+          flutter create . --org com.example.tgwsproxy --project-name tg_ws_proxy --platforms android,windows,macos
           
           # ۲. تزریق دسترسی اینترنت به مانیفست اندروید
           sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET"\/><application/' android/app/src/main/AndroidManifest.xml
 
-          # ۳. ساخت فایل pubspec.yaml
+          # ۳. تزریق دسترسی اجرای سرور محلی در محیط سندباکس مک (بسیار حیاتی برای SOCKS5 در مک)
+          sed -i 's/<\/dict>/\t<key>com.apple.security.network.server<\/key>\n\t<true\/>\n<\/dict>/' macos/Runner/Release.entitlements
+
+          # ۴. ساخت فایل جامع نیازمندی‌ها pubspec.yaml
           cat <<'YAML' > pubspec.yaml
           name: tg_ws_proxy
           description: SOCKS5 Proxy Manager for Telegram via Cloudflare Workers
@@ -65,10 +62,10 @@ jobs:
             uses-material-design: true
           YAML
 
-          # ۴. ایجاد دایرکتوری‌های فرعی
+          # ۵. ایجاد ساختار دایرکتوری‌های دارت
           mkdir -p lib/{models,services,providers,screens,widgets}
 
-          # ۵. مدل داده Worker
+          # ۶. فایل مدل داده کلاودفلر ورکر
           cat <<'DART' > lib/models/worker.dart
           class Worker {
             final String id;
@@ -96,7 +93,7 @@ jobs:
           }
           DART
 
-          # ۶. سرویس کلیپ‌بورد
+          # ۷. سرویس مدیریت کلیپ‌بورد سیستم‌عامل‌ها
           cat <<'DART' > lib/services/clipboard_service.dart
           import 'package:flutter/services.dart';
           class ClipboardService {
@@ -105,7 +102,7 @@ jobs:
           }
           DART
 
-          # ۷. سرویس پینگ و تاخیر شبکه
+          # ۸. سرویس پورت‌چک و پینگ کانال ارتباطی
           cat <<'DART' > lib/services/ping_service.dart
           import 'dart:async';
           import 'dart:io';
@@ -127,7 +124,7 @@ jobs:
           }
           DART
 
-          # ۸. سرویس اتصال به تلگرام
+          # ۹. سرویس تعامل با کلاینت تلگرام (Cross-Platform)
           cat <<'DART' > lib/services/telegram_service.dart
           import 'package:url_launcher/url_launcher.dart';
           class TelegramService {
@@ -139,7 +136,7 @@ jobs:
           }
           DART
 
-          # ۹. هسته سرور SOCKS5 با قابلیت لاگ سوئیچ‌شونده (پیش‌فرض خاموش)
+          # ۱۰. هسته اصلی سرور محلی SOCKS5 با لاگ سوئیچ‌شونده (پیش‌فرض غیرفعال)
           cat <<'DART' > lib/services/socks5_proxy_server.dart
           import 'dart:async';
           import 'dart:io';
@@ -154,7 +151,7 @@ jobs:
             int _activeConnections = 0;
             String _bindHost = '127.0.0.1';
             int _bindPort = 1080;
-            bool enableLogging = false; // لاگ‌ها به صورت پیش‌فرض غیرفعال هستند
+            bool enableLogging = false; 
 
             final StreamController<String> _statusController = StreamController<String>.broadcast();
             final StreamController<int> _connectionsController = StreamController<int>.broadcast();
@@ -188,7 +185,7 @@ jobs:
             }
 
             void _debug(String msg) {
-              if (!enableLogging) return; // اگر کاربر فعال نکرده باشد، پردازش و ذخیره نمی‌شود
+              if (!enableLogging) return; 
               final formattedMsg = '[SOCKS5] $msg';
               _debugLogController.add(formattedMsg);
               onDebugLog?.call(formattedMsg);
@@ -376,7 +373,7 @@ jobs:
           }
           DART
 
-          # ۱۰. مدیریت وضعیت با دامنه‌های پیش‌فرض Flowseal و سوئیچ دستی لاگ
+          # ۱۱. پرووایدر وضعیت همراه با دامنه‌های پیش‌فرض cfproxy-domains.txt پروژه Flowseal
           cat <<'DART' > lib/providers/app_state.dart
           import 'dart:convert';
           import 'package:flutter/foundation.dart';
@@ -403,7 +400,7 @@ jobs:
             bool _autoSwitch = false;
             late SharedPreferences _prefs;
 
-            // لیست کانفیگ‌ها و دامنه‌های رسمی پیش‌فرض موجود در cfproxy-domains.txt پروژه Flowseal
+            // دقیقاً دامنه‌های رسمی مخزن پروژه Flowseal به صورت از پیش‌پیکربندی شده
             final List<String> _defaultFlowsealDomains = [
               'https://bp.flowseal.site',
               'https://cfproxy.flowseal.workers.dev',
@@ -458,9 +455,7 @@ jobs:
               final port = _prefs.getInt('bindPort') ?? 1080;
               proxyServer.setBindAddress(host, port);
               _autoSwitch = _prefs.getBool('autoSwitch') ?? false;
-              
-              // بارگذاری وضعیت لاگ سیستم (پیش‌فرض خاموش/false است)
-              proxyServer.enableLogging = _prefs.getBool('enableLogging') ?? false;
+              proxyServer.enableLogging = _prefs.getBool('enableLogging') ?? false; // پیش‌فرض قطع است
             }
 
             void _loadWorkers() {
@@ -469,7 +464,6 @@ jobs:
                 final List<dynamic> list = json.decode(jsonString);
                 _workers = list.map((e) => Worker.fromJson(e as Map<String, dynamic>)).toList();
               } else {
-                // اگر برنامه برای اولین بار باز شده، دامنه‌های پیش‌فرض Flowseal بارگذاری می‌شوند
                 for (var url in _defaultFlowsealDomains) {
                   _workers.add(Worker(id: const Uuid().v4(), url: url));
                 }
@@ -505,11 +499,10 @@ jobs:
               notifyListeners();
             }
 
-            // متد فعال/غیرفعال‌سازی دستی لاگ توسط کاربر
             Future<void> setLoggingEnabled(bool value) async {
               proxyServer.enableLogging = value;
               await _prefs.setBool('enableLogging', value);
-              if (!value) _logs.clear(); // پاکسازی لاگ‌های قبلی در صورت غیرفعال کردن
+              if (!value) _logs.clear();
               _addLog('System logging ${value ? "enabled" : "disabled"}');
               notifyListeners();
             }
@@ -597,7 +590,7 @@ jobs:
             }
 
             void _addLog(String msg) {
-              if (!proxyServer.enableLogging) return; // عدم ثبت لاگ در صورت خاموش بودن سوئیچ دستی
+              if (!proxyServer.enableLogging) return; 
               _logs.add('[${DateTime.now().toIso8601String().substring(11, 19)}] $msg');
               if (_logs.length > 150) _logs.removeAt(0);
               notifyListeners();
@@ -623,7 +616,7 @@ jobs:
           }
           DART
 
-          # ۱۱. رابط کاربری اصلی با دکمه تنظیمات لاگ (HomeScreen)
+          # ۱۲. صفحه اصلی برنامه HomeScreen
           cat <<'DART' > lib/screens/home_screen.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
@@ -758,7 +751,7 @@ jobs:
           }
           DART
 
-          # ۱۲. صفحه نمایش لاگ‌ها (LogScreen)
+          # ۱۳. صفحه کنسول مانیتورینگ لاگ‌ها LogScreen
           cat <<'DART' > lib/screens/log_screen.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
@@ -795,7 +788,7 @@ jobs:
           }
           DART
 
-          # ۱۳. ویجت کارت آیتم دامنه‌ها (WorkerTile)
+          # ۱۴. ویجت کارت آیتم دامنه‌ها WorkerTile
           cat <<'DART' > lib/widgets/worker_tile.dart
           import 'package:flutter/material.dart';
           import '../models/worker.dart';
@@ -850,7 +843,7 @@ jobs:
           }
           DART
 
-          # ۱۴. ویجت سلف استاتوس پایین صفحه (BottomStatusBar)
+          # ۱۵. ویجت وضعیت کنترل بار پایینی BottomStatusBar
           cat <<'DART' > lib/widgets/bottom_status_bar.dart
           import 'package:flutter/material.dart';
 
@@ -916,7 +909,7 @@ jobs:
           }
           DART
 
-          # ۱۵. نقطه ورود برنامه (main.dart)
+          # ۱۶. فایل نقطه ورود به برنامه main.dart
           cat <<'DART' > lib/main.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
@@ -958,29 +951,142 @@ jobs:
           }
           DART
 
-      - name: Build Android Deployment Artifacts
+      - name: Upload Core Source as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-project
+          path: .
+
+  build-android:
+    name: Build Android App
+    needs: prepare-project
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Generated Project
+        uses: actions/download-artifact@v4
+        with:
+          name: flutter-project
+          path: .
+
+      - name: Set up Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+
+      - name: Compile Target Artifacts
         run: |
           flutter build apk --release
           flutter build apk --release --split-per-abi
           flutter build appbundle --release
 
-      - name: Organize Deployment Assets
+      - name: Restructure Deployment Deliverables
         run: |
-          mkdir -p release-artifacts
-          cp build/app/outputs/flutter-apk/app-release.apk release-artifacts/tg_ws_proxy_universal.apk
-          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk release-artifacts/tg_ws_proxy_armeabi-v7a.apk
-          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk release-artifacts/tg_ws_proxy_arm64-v8a.apk
-          cp build/app/outputs/flutter-apk/app-x86_64-release.apk release-artifacts/tg_ws_proxy_x86_64.apk
-          cp build/app/outputs/bundle/release/app-release.aab release-artifacts/tg_ws_proxy.aab
+          mkdir -p release-android
+          cp build/app/outputs/flutter-apk/app-release.apk release-android/tg_ws_proxy_android_universal.apk
+          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk release-android/tg_ws_proxy_android_armeabi-v7a.apk
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk release-android/tg_ws_proxy_android_arm64-v8a.apk
+          cp build/app/outputs/bundle/release/app-release.aab release-android/tg_ws_proxy_android.aab
 
-      - name: Automatic GitHub Release Generation
+      - name: Upload Android Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-binaries
+          path: release-android/*
+
+  build-windows:
+    name: Build Windows Application
+    needs: prepare-project
+    runs-on: windows-latest
+    steps:
+      - name: Download Generated Project
+        uses: actions/download-artifact@v4
+        with:
+          name: flutter-project
+          path: .
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+
+      - name: Enable Desktop Support
+        run: flutter config --enable-windows-desktop
+
+      - name: Compile Executable Binary
+        run: flutter build windows --release
+
+      - name: Compress Build Deliverable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-windows
+          Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath release-windows\tg_ws_proxy_windows.zip
+
+      - name: Upload Windows Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: release-windows/*
+
+  build-macos:
+    name: Build macOS Application
+    needs: prepare-project
+    runs-on: macos-latest
+    steps:
+      - name: Download Generated Project
+        uses: actions/download-artifact@v4
+        with:
+          name: flutter-project
+          path: .
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+
+      - name: Enable Desktop Support
+        run: flutter config --enable-macos-desktop
+
+      - name: Compile Executable Bundle
+        run: flutter build macos --release
+
+      - name: Package App Bundle
+        run: |
+          mkdir -p release-macos
+          cd build/macos/Build/Products/Release/
+          zip -r ../../../../release-macos/tg_ws_proxy_macOS.zip tg_ws_proxy.app
+
+      - name: Upload macOS Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-binaries
+          path: release-macos/*
+
+  publish-release:
+    name: Automate GitHub Deployment Release
+    needs: [build-android, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Multi-Platform Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: production-releases
+          merge-multiple: true
+
+      - name: Global Asset Deployment
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v1.0.0-build{0}', github.run_number) }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || format('Build v1.0.0-build{0}', github.run_number) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('Release Production v1.0.0 (Build {0})', github.run_number) }}
           draft: false
           prerelease: false
-          files: |
-            release-artifacts/*.apk
-            release-artifacts/*.aab
+          files: production-releases/*
