@@ -1,4 +1,4 @@
-name: Build & Release Multi-Platform (Android, Windows, macOS)
+name: Build & Release All Platforms
 
 on:
   push:
@@ -10,12 +10,18 @@ permissions:
   contents: write
 
 jobs:
-  prepare-project:
-    name: Initialize and Inject Multi-Platform Source Code
+  build-android:
+    name: Build and Release Android App
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Set up Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -23,18 +29,15 @@ jobs:
           flutter-version: '3.22.0'
           channel: 'stable'
 
-      - name: Create Framework & Inject Code
+      - name: Initialize Project & Inject Source Code
         run: |
-          # ۱. ایجاد ساختار نیتیو برای تمامی پلتفرم‌های مدنظر
-          flutter create . --org com.example.tgwsproxy --project-name tg_ws_proxy --platforms android,windows,macos
+          # ۱. ایجاد ساختار اولیه پروژه فلاتر در دایرکتوری جاری
+          flutter create . --org com.example.tgwsproxy --project-name tg_ws_proxy --platforms android
           
-          # ۲. تزریق دسترسی اینترنت به مانیفست اندروید
+          # ۲. تزریق دسترسی اینترنت به مانیفست اندروید (حیاتی برای عملکرد نسخه Release)
           sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET"\/><application/' android/app/src/main/AndroidManifest.xml
 
-          # ۳. تزریق دسترسی اجرای سرور محلی در محیط سندباکس مک (بسیار حیاتی برای SOCKS5 در مک)
-          sed -i 's/<\/dict>/\t<key>com.apple.security.network.server<\/key>\n\t<true\/>\n<\/dict>/' macos/Runner/Release.entitlements
-
-          # ۴. ساخت فایل جامع نیازمندی‌ها pubspec.yaml
+          # ۳. ساخت فایل pubspec.yaml با وابستگی‌های تعریف شده
           cat <<'YAML' > pubspec.yaml
           name: tg_ws_proxy
           description: SOCKS5 Proxy Manager for Telegram via Cloudflare Workers
@@ -62,10 +65,10 @@ jobs:
             uses-material-design: true
           YAML
 
-          # ۵. ایجاد ساختار دایرکتوری‌های دارت
+          # ۴. ایجاد دایرکتوری‌های فرعی معماری برنامه
           mkdir -p lib/{models,services,providers,screens,widgets}
 
-          # ۶. فایل مدل داده کلاودفلر ورکر
+          # ۵. نگارش مدل مدل Worker
           cat <<'DART' > lib/models/worker.dart
           class Worker {
             final String id;
@@ -93,7 +96,7 @@ jobs:
           }
           DART
 
-          # ۷. سرویس مدیریت کلیپ‌بورد سیستم‌عامل‌ها
+          # ۶. سرویس حافظه موقت سیستم
           cat <<'DART' > lib/services/clipboard_service.dart
           import 'package:flutter/services.dart';
           class ClipboardService {
@@ -102,7 +105,7 @@ jobs:
           }
           DART
 
-          # ۸. سرویس پورت‌چک و پینگ کانال ارتباطی
+          # ۷. سرویس ارزیابی تاخیر پینگ
           cat <<'DART' > lib/services/ping_service.dart
           import 'dart:async';
           import 'dart:io';
@@ -113,10 +116,12 @@ jobs:
                 final host = uri.host;
                 final port = uri.scheme == 'https' ? 443 : (uri.port != 0 ? uri.port : 80);
                 final sw = Stopwatch()..start();
-                final socket = await Socket.connect(host, port, timeout: const Duration(seconds: 4));
+                final socket = await Socket.connect(host, port, timeout: const Duration(seconds: 6));
                 socket.destroy();
                 sw.stop();
                 return sw.elapsedMilliseconds;
+              } on TimeoutException {
+                return -1;
               } catch (_) {
                 return -1;
               }
@@ -124,7 +129,7 @@ jobs:
           }
           DART
 
-          # ۹. سرویس تعامل با کلاینت تلگرام (Cross-Platform)
+          # ۸. سرویس فراخوانی اینتنت تلگرام
           cat <<'DART' > lib/services/telegram_service.dart
           import 'package:url_launcher/url_launcher.dart';
           class TelegramService {
@@ -136,7 +141,7 @@ jobs:
           }
           DART
 
-          # ۱۰. هسته اصلی سرور محلی SOCKS5 با لاگ سوئیچ‌شونده (پیش‌فرض غیرفعال)
+          # ۹. هسته پردازشی سرور پروکسی لوکال SOCKS5
           cat <<'DART' > lib/services/socks5_proxy_server.dart
           import 'dart:async';
           import 'dart:io';
@@ -151,8 +156,6 @@ jobs:
             int _activeConnections = 0;
             String _bindHost = '127.0.0.1';
             int _bindPort = 1080;
-            bool enableLogging = false; 
-
             final StreamController<String> _statusController = StreamController<String>.broadcast();
             final StreamController<int> _connectionsController = StreamController<int>.broadcast();
             final StreamController<String> _debugLogController = StreamController<String>.broadcast();
@@ -185,10 +188,8 @@ jobs:
             }
 
             void _debug(String msg) {
-              if (!enableLogging) return; 
-              final formattedMsg = '[SOCKS5] $msg';
-              _debugLogController.add(formattedMsg);
-              onDebugLog?.call(formattedMsg);
+              _debugLogController.add('[SOCKS5] $msg');
+              onDebugLog?.call('[SOCKS5] $msg');
             }
 
             Future<void> start() async {
@@ -264,8 +265,9 @@ jobs:
                   return;
                 }
                 final nmethods = greeting[1];
-                await readBytes(nmethods);
+                final methods = await readBytes(nmethods);
                 clientSocket.add(Uint8List.fromList([0x05, 0x00]));
+                _debug('SOCKS5 greeting OK');
 
                 final reqHeader = await readBytes(4);
                 if (reqHeader[0] != 0x05 || reqHeader[1] != 0x01) {
@@ -292,7 +294,7 @@ jobs:
                   clientSocket.destroy();
                   return;
                 }
-                _debug('Request for: ${_formatAddress(targetAddr)}');
+                _debug('SOCKS5 request for: ${_formatAddress(targetAddr)}');
 
                 String workerUrl = _activeWorker!.url;
                 if (workerUrl.startsWith('https://')) {
@@ -300,12 +302,13 @@ jobs:
                 } else if (workerUrl.startsWith('http://')) {
                   workerUrl = workerUrl.replaceFirst('http://', 'ws://');
                 }
+                _debug('Connecting WebSocket to $workerUrl');
 
                 sub.pause();
 
                 final wsChannel = WebSocketChannel.connect(Uri.parse(workerUrl));
                 await wsChannel.ready.timeout(const Duration(seconds: 10));
-                _debug('WebSocket tunnel established');
+                _debug('WebSocket connected');
 
                 clientSocket.add(Uint8List.fromList([0x05, 0x00, 0x00, ...targetAddr]));
 
@@ -313,16 +316,28 @@ jobs:
                 final wsSink = wsChannel.sink;
                 final wsStream = wsChannel.stream;
 
-                sub.onData((data) => wsSink.add(data));
-                sub.onDone(() => wsSink.close());
-                sub.onError((_) => wsSink.close());
+                sub.onData((data) {
+                  wsSink.add(data);
+                });
+                sub.onDone(() {
+                  wsSink.close();
+                });
+                sub.onError((e) {
+                  wsSink.close();
+                });
 
                 final wsToSocket = wsStream.listen(
                   (data) {
-                    try { clientSocket.add(data); } catch (_) {}
+                    try {
+                      clientSocket.add(data);
+                    } catch (_) {}
                   },
-                  onDone: () => clientSocket.destroy(),
-                  onError: (_) => clientSocket.destroy(),
+                  onDone: () {
+                    clientSocket.destroy();
+                  },
+                  onError: (e) {
+                    clientSocket.destroy();
+                  },
                   cancelOnError: true,
                 );
                 _connectionSubscriptions.add(sub);
@@ -333,16 +348,21 @@ jobs:
                   onConnectionRelayed?.call(_activeWorker!);
                 }
 
-                await Future.any([sub.asFuture<void>(), wsToSocket.asFuture<void>()]);
+                await Future.any([
+                  sub.asFuture<void>(),
+                  wsToSocket.asFuture<void>(),
+                ]);
               } catch (e) {
-                _debug('Tunnel error: $e');
+                _debug('Connection error: $e');
                 try {
                   clientSocket.add(Uint8List.fromList([0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
                 } catch (_) {}
               } finally {
                 _activeConnections--;
                 _connectionsController.add(_activeConnections);
-                try { clientSocket.destroy(); } catch (_) {}
+                try {
+                  clientSocket.destroy();
+                } catch (_) {}
               }
             }
 
@@ -350,11 +370,15 @@ jobs:
               if (addr.isEmpty) return 'unknown';
               final type = addr[0];
               if (type == 0x01 && addr.length >= 7) {
-                return '${addr[1]}.${addr[2]}.${addr[3]}.${addr[4]}:${(addr[5] << 8) | addr[6]}';
+                final ip = '${addr[1]}.${addr[2]}.${addr[3]}.${addr[4]}';
+                final port = (addr[5] << 8) | addr[6];
+                return '$ip:$port';
               } else if (type == 0x03 && addr.length >= 2) {
                 final len = addr[1];
                 if (addr.length >= 2 + len + 2) {
-                  return String.fromCharCodes(addr.sublist(2, 2 + len));
+                  final domain = String.fromCharCodes(addr.sublist(2, 2 + len));
+                  final port = (addr[2 + len] << 8) | addr[3 + len];
+                  return '$domain:$port';
                 }
               }
               return 'unknown';
@@ -373,7 +397,7 @@ jobs:
           }
           DART
 
-          # ۱۱. پرووایدر وضعیت همراه با دامنه‌های پیش‌فرض cfproxy-domains.txt پروژه Flowseal
+          # ۱۰. مدیریت وضعیت سراسری اپلیکیشن (State Management)
           cat <<'DART' > lib/providers/app_state.dart
           import 'dart:convert';
           import 'package:flutter/foundation.dart';
@@ -400,15 +424,6 @@ jobs:
             bool _autoSwitch = false;
             late SharedPreferences _prefs;
 
-            // دقیقاً دامنه‌های رسمی مخزن پروژه Flowseal به صورت از پیش‌پیکربندی شده
-            final List<String> _defaultFlowsealDomains = [
-              'https://bp.flowseal.site',
-              'https://cfproxy.flowseal.workers.dev',
-              'https://skk.flowseal.site',
-              'https://warp.flowseal.site',
-              'https://free.flowseal.workers.dev'
-            ];
-
             AppState({required this.proxyServer, required this.clipboardService, required this.telegramService, required this.pingService}) {
               proxyServer.statusStream.listen((status) {
                 _proxyStatus = status;
@@ -420,8 +435,12 @@ jobs:
                 _activeConnections = count;
                 notifyListeners();
               });
-              proxyServer.debugLogStream.listen((msg) => _addLog(msg));
-              proxyServer.onDebugLog = (msg) => _addLog(msg);
+              proxyServer.debugLogStream.listen((msg) {
+                _addLog(msg);
+              });
+              proxyServer.onDebugLog = (msg) {
+                _addLog(msg);
+              };
               proxyServer.onConnectionRelayed = (worker) {
                 if (_autoSwitch && worker == _selectedWorker && worker.requestCount >= worker.maxRequests) {
                   _switchToNextWorker();
@@ -438,7 +457,6 @@ jobs:
             List<String> get logs => _logs;
             int get activeConnections => _activeConnections;
             bool get autoSwitch => _autoSwitch;
-            bool get enableLogging => proxyServer.enableLogging;
             String get bindHost => proxyServer.bindHost;
             int get bindPort => proxyServer.bindPort;
 
@@ -455,26 +473,17 @@ jobs:
               final port = _prefs.getInt('bindPort') ?? 1080;
               proxyServer.setBindAddress(host, port);
               _autoSwitch = _prefs.getBool('autoSwitch') ?? false;
-              proxyServer.enableLogging = _prefs.getBool('enableLogging') ?? false; // پیش‌فرض قطع است
             }
 
             void _loadWorkers() {
               final jsonString = _prefs.getString('workers');
-              if (jsonString != null && jsonString.isNotEmpty) {
+              if (jsonString != null) {
                 final List<dynamic> list = json.decode(jsonString);
                 _workers = list.map((e) => Worker.fromJson(e as Map<String, dynamic>)).toList();
-              } else {
-                for (var url in _defaultFlowsealDomains) {
-                  _workers.add(Worker(id: const Uuid().v4(), url: url));
+                final selectedId = _prefs.getString('selectedWorkerId');
+                if (selectedId != null) {
+                  _selectedWorker = _workers.firstWhere((w) => w.id == selectedId, orElse: () => _workers.first);
                 }
-                _saveWorkers();
-              }
-
-              final selectedId = _prefs.getString('selectedWorkerId');
-              if (selectedId != null) {
-                _selectedWorker = _workers.firstWhere((w) => w.id == selectedId, orElse: () => _workers.isNotEmpty ? _workers.first : null);
-              } else if (_workers.isNotEmpty) {
-                _selectedWorker = _workers.first;
               }
             }
 
@@ -499,14 +508,6 @@ jobs:
               notifyListeners();
             }
 
-            Future<void> setLoggingEnabled(bool value) async {
-              proxyServer.enableLogging = value;
-              await _prefs.setBool('enableLogging', value);
-              if (!value) _logs.clear();
-              _addLog('System logging ${value ? "enabled" : "disabled"}');
-              notifyListeners();
-            }
-
             Future<void> importWorkerFromClipboard() async {
               final text = await clipboardService.getClipboardData();
               if (text != null && text.isNotEmpty) {
@@ -519,6 +520,7 @@ jobs:
                 worker.pingLatency = latency;
                 worker.isOnline = latency != -1;
                 await _saveWorkers();
+                _addLog('${worker.url} -> ${worker.isOnline ? "${latency}ms" : "OFFLINE"}');
                 notifyListeners();
               }
             }
@@ -536,12 +538,14 @@ jobs:
                 _selectedWorker = _workers.isNotEmpty ? _workers.first : null;
               }
               await _saveWorkers();
+              _addLog('Removed ${w.url}');
               notifyListeners();
             }
 
             Future<void> copyWorkerUrl(Worker w) async {
               await clipboardService.setClipboardData(w.url);
               _addLog('Copied URL: ${w.url}');
+              notifyListeners();
             }
 
             Future<void> copyAllWorkers() async {
@@ -549,11 +553,15 @@ jobs:
               final all = _workers.map((w) => w.url).join('\n');
               await clipboardService.setClipboardData(all);
               _addLog('Copied all worker URLs');
+              notifyListeners();
             }
 
             Future<void> copyLogs() async {
               if (_logs.isEmpty) return;
-              await clipboardService.setClipboardData(_logs.join('\n'));
+              final all = _logs.join('\n');
+              await clipboardService.setClipboardData(all);
+              _addLog('Logs copied to clipboard');
+              notifyListeners();
             }
 
             Future<void> pingAll() async {
@@ -562,6 +570,7 @@ jobs:
                 final latency = await pingService.ping(w.url);
                 w.pingLatency = latency;
                 w.isOnline = latency != -1;
+                _addLog('${w.url} -> ${w.isOnline ? "${latency}ms" : "OFFLINE"}');
               }
               await _saveWorkers();
               notifyListeners();
@@ -581,7 +590,8 @@ jobs:
             }
 
             Future<void> openInTelegram() async {
-              await telegramService.openTelegramProxySettings(server: bindHost, port: bindPort);
+              final ok = await telegramService.openTelegramProxySettings(server: bindHost, port: bindPort);
+              _addLog(ok ? 'Opened Telegram' : 'Failed to open Telegram');
             }
 
             void clearLogs() {
@@ -590,9 +600,8 @@ jobs:
             }
 
             void _addLog(String msg) {
-              if (!proxyServer.enableLogging) return; 
-              _logs.add('[${DateTime.now().toIso8601String().substring(11, 19)}] $msg');
-              if (_logs.length > 150) _logs.removeAt(0);
+              _logs.add('[${DateTime.now().toIso8601String()}] $msg');
+              if (_logs.length > 200) _logs.removeAt(0);
               notifyListeners();
             }
 
@@ -604,6 +613,7 @@ jobs:
               int nextIdx = (currentIdx + 1) % onlineWorkers.length;
               _selectedWorker = onlineWorkers[nextIdx];
               proxyServer.setActiveWorker(_selectedWorker);
+              _addLog('Auto-switched to ${_selectedWorker!.url}');
               _saveWorkers();
               notifyListeners();
             }
@@ -614,13 +624,15 @@ jobs:
               super.dispose();
             }
           }
+          }
           DART
 
-          # ۱۲. صفحه اصلی برنامه HomeScreen
+          # ۱۱. صفحه رابط کاربری اصلی (HomeScreen)
           cat <<'DART' > lib/screens/home_screen.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
           import '../providers/app_state.dart';
+          import '../models/worker.dart';
           import '../widgets/worker_tile.dart';
           import '../widgets/bottom_status_bar.dart';
           import 'log_screen.dart';
@@ -636,8 +648,6 @@ jobs:
               final hostCtrl = TextEditingController(text: app.bindHost);
               final portCtrl = TextEditingController(text: app.bindPort.toString());
               bool autoSwitch = app.autoSwitch;
-              bool enableLogging = app.enableLogging;
-
               showDialog(
                 context: context,
                 builder: (ctx) => StatefulBuilder(
@@ -648,17 +658,7 @@ jobs:
                       children: [
                         TextField(controller: hostCtrl, decoration: const InputDecoration(labelText: 'Bind IP')),
                         TextField(controller: portCtrl, decoration: const InputDecoration(labelText: 'Bind Port'), keyboardType: TextInputType.number),
-                        SwitchListTile(
-                          title: const Text('Auto-switch on limit'),
-                          value: autoSwitch,
-                          onChanged: (val) { setState(() { autoSwitch = val; }); },
-                        ),
-                        SwitchListTile(
-                          title: const Text('Enable Debug Logs'),
-                          subtitle: const Text('Manually record proxy traffic'),
-                          value: enableLogging,
-                          onChanged: (val) { setState(() { enableLogging = val; }); },
-                        ),
+                        SwitchListTile(title: const Text('Auto-switch on limit'), value: autoSwitch, onChanged: (val) { setState(() { autoSwitch = val; }); }),
                       ],
                     ),
                     actions: [
@@ -669,7 +669,6 @@ jobs:
                           final port = int.tryParse(portCtrl.text.trim());
                           if (host.isNotEmpty && port != null && port > 0) app.setBindAddress(host, port);
                           app.setAutoSwitch(autoSwitch);
-                          app.setLoggingEnabled(enableLogging);
                           Navigator.pop(ctx);
                         },
                         child: const Text('Save'),
@@ -700,10 +699,10 @@ jobs:
                         }
                       },
                       itemBuilder: (context) => [
-                        const PopupMenuItem(value: 'import', child: ListTile(leading: Icon(Icons.content_paste), title: Text('Import clipboard URL'))),
+                        const PopupMenuItem(value: 'import', child: ListTile(leading: Icon(Icons.content_paste), title: Text('Import worker by clipboard'))),
                         const PopupMenuItem(value: 'copy_all', child: ListTile(leading: Icon(Icons.copy_all), title: Text('Copy all workers'))),
                         const PopupMenuItem(value: 'ping_all', child: ListTile(leading: Icon(Icons.speed), title: Text('Ping all'))),
-                        const PopupMenuItem(value: 'logs', child: ListTile(leading: Icon(Icons.terminal), title: Text('Console Logs'))),
+                        const PopupMenuItem(value: 'logs', child: ListTile(leading: Icon(Icons.terminal), title: Text('Logs'))),
                         const PopupMenuItem(value: 'settings', child: ListTile(leading: Icon(Icons.settings), title: Text('Settings'))),
                       ],
                     ),
@@ -724,19 +723,21 @@ jobs:
                       ),
                     ),
                     Expanded(
-                      child: ListView.builder(
-                        itemCount: app.workers.length,
-                        itemBuilder: (_, i) {
-                          final w = app.workers[i];
-                          return WorkerTile(
-                            worker: w,
-                            isSelected: app.selectedWorker == w,
-                            onTap: () => app.selectWorker(w),
-                            onRemove: () => app.removeWorker(w),
-                            onCopy: () => app.copyWorkerUrl(w),
-                          );
-                        },
-                      ),
+                      child: app.workers.isEmpty
+                          ? const Center(child: Text('No workers imported.\nUse the menu to import.'))
+                          : ListView.builder(
+                              itemCount: app.workers.length,
+                              itemBuilder: (_, i) {
+                                final w = app.workers[i];
+                                return WorkerTile(
+                                  worker: w,
+                                  isSelected: app.selectedWorker == w,
+                                  onTap: () => app.selectWorker(w),
+                                  onRemove: () => app.removeWorker(w),
+                                  onCopy: () => app.copyWorkerUrl(w),
+                                );
+                              },
+                            ),
                     ),
                   ],
                 ),
@@ -751,12 +752,11 @@ jobs:
           }
           DART
 
-          # ۱۳. صفحه کنسول مانیتورینگ لاگ‌ها LogScreen
+          # ۱۲. تکمیل پیاده سازی نهایی صفحه لاگ ترمینال (LogScreen)
           cat <<'DART' > lib/screens/log_screen.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
           import '../providers/app_state.dart';
-
           class LogScreen extends StatelessWidget {
             const LogScreen({super.key});
             @override
@@ -764,31 +764,24 @@ jobs:
               final app = context.watch<AppState>();
               return Scaffold(
                 appBar: AppBar(title: const Text('Logs'), actions: [
-                  if (app.enableLogging) ...[
-                    IconButton(icon: const Icon(Icons.copy), onPressed: () => app.copyLogs(), tooltip: 'Copy logs'),
-                    IconButton(icon: const Icon(Icons.cleaning_services), onPressed: () => app.clearLogs(), tooltip: 'Clear Logs'),
-                  ]
+                  IconButton(icon: const Icon(Icons.copy), onPressed: () => app.copyLogs(), tooltip: 'Copy logs'),
+                  IconButton(icon: const Icon(Icons.cleaning_services), onPressed: () => app.clearLogs(), tooltip: 'Clear Logs'),
                 ]),
-                body: !app.enableLogging
-                    ? const Center(child: Padding(
-                        padding: EdgeInsets.all(24),
-                        child: Text('Logging is disabled.\nEnable "Debug Logs" in Settings to view activity.', textAlign: TextAlign.center),
-                      ))
-                    : app.logs.isEmpty
-                        ? const Center(child: Text('Console is empty'))
-                        : ListView.builder(
-                            itemCount: app.logs.length,
-                            itemBuilder: (_, i) => Padding(
-                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
-                              child: Text(app.logs[i], style: const TextStyle(fontSize: 11, fontFamily: 'monospace')),
-                            ),
-                          ),
+                body: app.logs.isEmpty
+                    ? const Center(child: Text('No logs'))
+                    : ListView.builder(
+                        itemCount: app.logs.length,
+                        itemBuilder: (_, i) => Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                          child: Text(app.logs[i], style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
+                        ),
+                      ),
               );
             }
           }
           DART
 
-          # ۱۴. ویجت کارت آیتم دامنه‌ها WorkerTile
+          # ۱۳. ساخت ویجت اختصاصی لیست کارت‌ها (WorkerTile)
           cat <<'DART' > lib/widgets/worker_tile.dart
           import 'package:flutter/material.dart';
           import '../models/worker.dart';
@@ -817,7 +810,7 @@ jobs:
                 child: ListTile(
                   onTap: onTap,
                   leading: Icon(
-                    worker.isOnline ? Icons.bolt : Icons.cloud_queue,
+                    worker.isOnline ? Icons.dns : Icons.cloud_off,
                     color: worker.isOnline ? Colors.green : Colors.grey,
                   ),
                   title: Text(
@@ -827,14 +820,16 @@ jobs:
                     style: TextStyle(fontWeight: isSelected ? FontWeight.bold : FontWeight.normal),
                   ),
                   subtitle: Text(
-                    worker.isOnline ? 'Ping: ${worker.pingLatency}ms | Total Relayed: ${worker.requestCount}' : 'No Connection / Untested',
+                    worker.isOnline
+                        ? 'Latency: ${worker.pingLatency}ms | Req: ${worker.requestCount}'
+                        : 'Offline / Untested',
                     style: const TextStyle(fontSize: 12),
                   ),
                   trailing: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      IconButton(icon: const Icon(Icons.copy, size: 18), onPressed: onCopy),
-                      IconButton(icon: const Icon(Icons.delete, size: 18, color: Colors.red), onPressed: onRemove),
+                      IconButton(icon: const Icon(Icons.copy, size: 20), onPressed: onCopy, tooltip: 'Copy URL'),
+                      IconButton(icon: const Icon(Icons.delete, size: 20, color: Colors.red), onPressed: onRemove, tooltip: 'Remove'),
                     ],
                   ),
                 ),
@@ -843,7 +838,7 @@ jobs:
           }
           DART
 
-          # ۱۵. ویجت وضعیت کنترل بار پایینی BottomStatusBar
+          # ۱۴. ساخت ویجت کنترل وضعیت پایینی (BottomStatusBar)
           cat <<'DART' > lib/widgets/bottom_status_bar.dart
           import 'package:flutter/material.dart';
 
@@ -880,7 +875,8 @@ jobs:
                             Row(
                               children: [
                                 Container(
-                                  width: 10, height: 10,
+                                  width: 10,
+                                  height: 10,
                                   decoration: BoxDecoration(shape: BoxShape.circle, color: isRunning ? Colors.green : Colors.red),
                                 ),
                                 const SizedBox(width: 8),
@@ -888,14 +884,14 @@ jobs:
                               ],
                             ),
                             const SizedBox(height: 4),
-                            Text('Active Sessions: $activeConnections', style: const TextStyle(fontSize: 12)),
+                            Text('Active Connections: $activeConnections', style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
                           ],
                         ),
                       ),
                       ElevatedButton.icon(
                         onPressed: onToggle,
                         icon: Icon(isRunning ? Icons.stop : Icons.play_arrow),
-                        label: Text(isRunning ? 'Stop' : 'Start'),
+                        label: Text(isRunning ? 'Stop Server' : 'Start Server'),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: isRunning ? Colors.red.shade100 : Colors.green.shade100,
                           foregroundColor: isRunning ? Colors.red.shade900 : Colors.green.shade900,
@@ -909,7 +905,7 @@ jobs:
           }
           DART
 
-          # ۱۶. فایل نقطه ورود به برنامه main.dart
+          # ۱۵. ساخت فایل ورود اصلی برنامه (main.dart)
           cat <<'DART' > lib/main.dart
           import 'package:flutter/material.dart';
           import 'package:provider/provider.dart';
@@ -922,13 +918,18 @@ jobs:
 
           void main() {
             WidgetsFlutterBinding.ensureInitialized();
+            final proxyServer = Socks5ProxyServer();
+            final clipboardService = ClipboardService();
+            final telegramService = TelegramService();
+            final pingService = PingService();
+
             runApp(
               ChangeNotifierProvider(
                 create: (_) => AppState(
-                  proxyServer: Socks5ProxyServer(),
-                  clipboardService: ClipboardService(),
-                  telegramService: TelegramService(),
-                  pingService: PingService(),
+                  proxyServer: proxyServer,
+                  clipboardService: clipboardService,
+                  telegramService: telegramService,
+                  pingService: pingService,
                 ),
                 child: const MyApp(),
               ),
@@ -951,142 +952,34 @@ jobs:
           }
           DART
 
-      - name: Upload Core Source as Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: flutter-project
-          path: .
-
-  build-android:
-    name: Build Android App
-    needs: prepare-project
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download Generated Project
-        uses: actions/download-artifact@v4
-        with:
-          name: flutter-project
-          path: .
-
-      - name: Set up Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'zulu'
-          java-version: '17'
-
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.22.0'
-          channel: 'stable'
-
-      - name: Compile Target Artifacts
+      - name: Build Android Deployment Artifacts
         run: |
+          # تولید نسخه یونیورسال فونداسیون (شامل تمام معماری‌ها در یک فایل)
           flutter build apk --release
+          
+          # تولید نسخه‌های تفکیک شده براساس معماری پردازنده (Split-per-ABI) برای کاهش حجم دانلود کاربر
           flutter build apk --release --split-per-abi
+          
+          # تولید بسته نهایی باندل گوگل‌پلی
           flutter build appbundle --release
 
-      - name: Restructure Deployment Deliverables
+      - name: Organize Deployment Assets
         run: |
-          mkdir -p release-android
-          cp build/app/outputs/flutter-apk/app-release.apk release-android/tg_ws_proxy_android_universal.apk
-          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk release-android/tg_ws_proxy_android_armeabi-v7a.apk
-          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk release-android/tg_ws_proxy_android_arm64-v8a.apk
-          cp build/app/outputs/bundle/release/app-release.aab release-android/tg_ws_proxy_android.aab
+          mkdir -p release-artifacts
+          cp build/app/outputs/flutter-apk/app-release.apk release-artifacts/tg_ws_proxy_universal.apk
+          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk release-artifacts/tg_ws_proxy_armeabi-v7a.apk
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk release-artifacts/tg_ws_proxy_arm64-v8a.apk
+          cp build/app/outputs/flutter-apk/app-x86_64-release.apk release-artifacts/tg_ws_proxy_x86_64.apk
+          cp build/app/outputs/bundle/release/app-release.aab release-artifacts/tg_ws_proxy.aab
 
-      - name: Upload Android Binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-binaries
-          path: release-android/*
-
-  build-windows:
-    name: Build Windows Application
-    needs: prepare-project
-    runs-on: windows-latest
-    steps:
-      - name: Download Generated Project
-        uses: actions/download-artifact@v4
-        with:
-          name: flutter-project
-          path: .
-
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.22.0'
-          channel: 'stable'
-
-      - name: Enable Desktop Support
-        run: flutter config --enable-windows-desktop
-
-      - name: Compile Executable Binary
-        run: flutter build windows --release
-
-      - name: Compress Build Deliverable
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path release-windows
-          Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath release-windows\tg_ws_proxy_windows.zip
-
-      - name: Upload Windows Binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-binaries
-          path: release-windows/*
-
-  build-macos:
-    name: Build macOS Application
-    needs: prepare-project
-    runs-on: macos-latest
-    steps:
-      - name: Download Generated Project
-        uses: actions/download-artifact@v4
-        with:
-          name: flutter-project
-          path: .
-
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.22.0'
-          channel: 'stable'
-
-      - name: Enable Desktop Support
-        run: flutter config --enable-macos-desktop
-
-      - name: Compile Executable Bundle
-        run: flutter build macos --release
-
-      - name: Package App Bundle
-        run: |
-          mkdir -p release-macos
-          cd build/macos/Build/Products/Release/
-          zip -r ../../../../release-macos/tg_ws_proxy_macOS.zip tg_ws_proxy.app
-
-      - name: Upload macOS Binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-binaries
-          path: release-macos/*
-
-  publish-release:
-    name: Automate GitHub Deployment Release
-    needs: [build-android, build-windows, build-macos]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download All Multi-Platform Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: production-releases
-          merge-multiple: true
-
-      - name: Global Asset Deployment
+      - name: Automatic GitHub Release Generation
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v1.0.0-build{0}', github.run_number) }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || format('Release Production v1.0.0 (Build {0})', github.run_number) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('Build v1.0.0-build{0}', github.run_number) }}
           draft: false
           prerelease: false
-          files: production-releases/*
+          files: |
+            release-artifacts/*.apk
+            release-artifacts/*.aab
